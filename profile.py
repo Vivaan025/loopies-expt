@@ -92,6 +92,34 @@ def main():
 
     profile_model.eval()
 
+    if device.type == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        static_x = x.clone()
+
+        with torch.no_grad():
+            for _ in range(3):
+                profile_model(static_x)
+
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            static_output = profile_model(static_x)
+
+        graph.replay()
+
+        with torch.no_grad():
+            normal_output = profile_model(static_x)
+
+        graph_output = static_output.clone()
+
+        torch.cuda.synchronize()
+
+        difference = torch.max(
+            torch.abs(normal_output - graph_output)
+        )
+
+        print(f"Max difference between normal and graph output: {difference.item()}")
+
+
     with torch.no_grad():
         profile_model(x)
 
