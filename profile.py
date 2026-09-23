@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.profiler import profile, record_function, ProfilerActivity
 import time
+import statistics
 from attention import TransformerBlock
 
 
@@ -67,13 +68,13 @@ def main():
     batch_size = 8
     sequence_length = 128
     d_model = 8
-    loops = 3
+    loop_count = [1,2,3,4,6,8]
 
-    model = LoopTransformer(
-        loops=loops
-    ).to(device)
+    # model = LoopTransformer(
+    #     loops=loops
+    # ).to(device)
 
-    model.eval()
+    # model.eval()
 
     x = torch.randn(
         batch_size,
@@ -83,17 +84,20 @@ def main():
     )
 
     print("Input shape :", x.shape)
-    print("Loops       :", loops)
 
-    # Warm-up
+
+    profile_loops = 8
+
+    profile_model = LoopTransformer(loops=profile_loops).to(device)
+
+    profile_model.eval()
+
     with torch.no_grad():
-        for _ in range(20):
-            model(x)
+        profile_model(x)
 
     if device.type == "cuda":
         torch.cuda.synchronize()
 
-    # Profile
     with profile(
         activities=[
             ProfilerActivity.CPU,
@@ -104,7 +108,7 @@ def main():
     ) as prof:
 
         with torch.no_grad():
-            model(x)
+            profile_model(x)
 
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -117,6 +121,58 @@ def main():
             row_limit=30
         )
     )
+
+
+    # print("Loops       :", loops)
+
+    # for loops in loop_count:
+    #     print(f"Loops: {loops}")
+    #     model = LoopTransformer(loops=loops).to(device)
+
+    #     times = []
+        
+    #     for _ in range(5):
+    #         average_ms = (benchmark_model(model, x, iterations=200))
+    #         times.append(average_ms)
+
+    #     median_ms = statistics.median(times)
+    #     per_loop_ms = median_ms / loops
+        # print(f"Average time: {average_ms:.4f} ms")
+        # print(f"Median time: {median_ms:.4f} ms")
+        # print(f"Time per loop: {per_loop_ms:.4f} ms")
+
+    # Warm-up
+    # with torch.no_grad():
+    #     for _ in range(20):
+    #         model(x)
+
+    # if device.type == "cuda":
+    #     torch.cuda.synchronize()
+
+    # # Profile
+    # with profile(
+    #     activities=[
+    #         ProfilerActivity.CPU,
+    #         ProfilerActivity.CUDA
+    #     ],
+    #     record_shapes=True,
+    #     profile_memory=True
+    # ) as prof:
+
+    #     with torch.no_grad():
+    #         model(x)
+
+    #     if device.type == "cuda":
+    #         torch.cuda.synchronize()
+
+    # print("\n========== PROFILE ==========\n")
+
+    # print(
+    #     prof.key_averages().table(
+    #         sort_by="cuda_time_total",
+    #         row_limit=30
+    #     )
+    # )
 
 
 if __name__ == "__main__":
