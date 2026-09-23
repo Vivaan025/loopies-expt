@@ -119,6 +119,47 @@ def main():
 
         print(f"Max difference between normal and graph output: {difference.item()}")
 
+    iterations = 1000
+
+    # -------------------------
+    # Normal execution
+    # -------------------------
+
+    torch.cuda.synchronize()
+
+    start = time.perf_counter()
+
+    with torch.no_grad():
+        for _ in range(iterations):
+            profile_model(static_x)
+
+    torch.cuda.synchronize()
+
+    normal_time = (time.perf_counter() - start) * 1000 / iterations
+
+
+    # -------------------------
+    # CUDA Graph execution
+    # -------------------------
+
+    torch.cuda.synchronize()
+
+    start = time.perf_counter()
+
+    for _ in range(iterations):
+        graph.replay()
+
+    torch.cuda.synchronize()
+
+    graph_time = (time.perf_counter() - start) * 1000 / iterations
+
+
+    print("\n========== CUDA GRAPH BENCHMARK ==========")
+    print(f"Normal execution : {normal_time:.6f} ms")
+    print(f"CUDA Graph       : {graph_time:.6f} ms")
+    print(f"Speedup          : {normal_time / graph_time:.2f}x")
+    print(f"Reduction        : {(1 - graph_time / normal_time) * 100:.2f}%")
+
 
     with torch.no_grad():
         profile_model(x)
@@ -141,14 +182,14 @@ def main():
         if device.type == "cuda":
             torch.cuda.synchronize()
 
-    print("\n========== PROFILE ==========\n")
+    # print("\n========== PROFILE ==========\n")
 
-    print(
-        prof.key_averages().table(
-            sort_by="cuda_time_total",
-            row_limit=30
-        )
-    )
+    # print(
+    #     prof.key_averages().table(
+    #         sort_by="cuda_time_total",
+    #         row_limit=30
+    #     )
+    # )
 
 
     # print("Loops       :", loops)
