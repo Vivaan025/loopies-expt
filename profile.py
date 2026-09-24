@@ -166,6 +166,30 @@ def main():
         print(f"Speedup          : {normal_time / graph_time:.2f}x")
         print(f"Reduction        : {(1 - graph_time / normal_time) * 100:.2f}%")
 
+        if loops == 8:
+            print("\n========== 8-LOOP PROFILER ==========")
+
+            with profile(
+                activities=[
+                    ProfilerActivity.CPU,
+                    ProfilerActivity.CUDA
+                ],
+                record_shapes=True,
+                profile_memory=True
+            ) as prof:
+
+                with torch.no_grad():
+                    profile_model(static_x)
+
+                torch.cuda.synchronize()
+
+            print(
+                prof.key_averages().table(
+                    sort_by="cuda_time_total",
+                    row_limit=30
+                )
+            )
+
 
     # profile_model = LoopTransformer(loops=loop_counts).to(device)
 
