@@ -86,80 +86,90 @@ def main():
     print("Input shape :", x.shape)
 
 
-    profile_loops = 8
+    # profile_loops = 8
+    loop_counts = [1, 2, 3, 4, 6, 8]
+    for loops in loop_counts:
 
-    profile_model = LoopTransformer(loops=profile_loops).to(device)
+        print(f"\n========== {loops} LOOPS ==========")
 
-    profile_model.eval()
+        profile_model = LoopTransformer(
+            loops=loops
+        ).to(device)
 
-    if device.type == "cuda":
-        graph = torch.cuda.CUDAGraph()
-        static_x = x.clone()
+        profile_model.eval()
 
+        if device.type == "cuda":
+            graph = torch.cuda.CUDAGraph()
+            static_x = x.clone()
+
+            with torch.no_grad():
+                for _ in range(3):
+                    profile_model(static_x)
+
+            torch.cuda.synchronize()
+            with torch.cuda.graph(graph):
+                static_output = profile_model(static_x)
+
+            graph.replay()
+
+            with torch.no_grad():
+                normal_output = profile_model(static_x)
+
+            graph_output = static_output.clone()
+
+            torch.cuda.synchronize()
+
+            difference = torch.max(
+                torch.abs(normal_output - graph_output)
+            )
+
+            print(f"Max difference between normal and graph output: {difference.item()}")
+
+        iterations = 1000
+        
+        # -------------------------
+        # Normal execution
+        # -------------------------
+        
+        torch.cuda.synchronize()
+        
+        start = time.perf_counter()
+        
         with torch.no_grad():
-            for _ in range(3):
+            for _ in range(iterations):
                 profile_model(static_x)
-
+        
         torch.cuda.synchronize()
-        with torch.cuda.graph(graph):
-            static_output = profile_model(static_x)
-
-        graph.replay()
-
-        with torch.no_grad():
-            normal_output = profile_model(static_x)
-
-        graph_output = static_output.clone()
-
+        
+        normal_time = (time.perf_counter() - start) * 1000 / iterations
+        
+        
+        # -------------------------
+        # CUDA Graph execution
+        # -------------------------
+        
         torch.cuda.synchronize()
-
-        difference = torch.max(
-            torch.abs(normal_output - graph_output)
-        )
-
-        print(f"Max difference between normal and graph output: {difference.item()}")
-
-    iterations = 1000
-
-    # -------------------------
-    # Normal execution
-    # -------------------------
-
-    torch.cuda.synchronize()
-
-    start = time.perf_counter()
-
-    with torch.no_grad():
+    
+        start = time.perf_counter()
+        
         for _ in range(iterations):
-            profile_model(static_x)
-
-    torch.cuda.synchronize()
-
-    normal_time = (time.perf_counter() - start) * 1000 / iterations
-
-
-    # -------------------------
-    # CUDA Graph execution
-    # -------------------------
-
-    torch.cuda.synchronize()
-
-    start = time.perf_counter()
-
-    for _ in range(iterations):
-        graph.replay()
-
-    torch.cuda.synchronize()
-
-    graph_time = (time.perf_counter() - start) * 1000 / iterations
+            graph.replay()
+        
+        torch.cuda.synchronize()
+        
+        graph_time = (time.perf_counter() - start) * 1000 / iterations
+        
+        
+        print("\n========== CUDA GRAPH BENCHMARK ==========")
+        print(f"Normal execution : {normal_time:.6f} ms")
+        print(f"CUDA Graph       : {graph_time:.6f} ms")
+        print(f"Speedup          : {normal_time / graph_time:.2f}x")
+        print(f"Reduction        : {(1 - graph_time / normal_time) * 100:.2f}%")
 
 
-    print("\n========== CUDA GRAPH BENCHMARK ==========")
-    print(f"Normal execution : {normal_time:.6f} ms")
-    print(f"CUDA Graph       : {graph_time:.6f} ms")
-    print(f"Speedup          : {normal_time / graph_time:.2f}x")
-    print(f"Reduction        : {(1 - graph_time / normal_time) * 100:.2f}%")
+    # profile_model = LoopTransformer(loops=loop_counts).to(device)
 
+    # profile_model.eval()
 
     with torch.no_grad():
         profile_model(x)
