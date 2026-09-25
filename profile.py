@@ -85,6 +85,7 @@ def main():
 
     print("Input shape :", x.shape)
 
+    benchmark_trials = 5
 
     # profile_loops = 8
     loop_counts = [1, 2, 3, 4, 6, 8]
@@ -125,46 +126,76 @@ def main():
 
             print(f"Max difference between normal and graph output: {difference.item()}")
 
-        iterations = 1000
+        normal_times = []
+        graph_times = []
+
+
+        for trial in range(benchmark_trials):
+            iterations = 1000
+
         
-        # -------------------------
-        # Normal execution
-        # -------------------------
+            # -------------------------
+            # Normal execution
+            # -------------------------
+            
+            torch.cuda.synchronize()
+            
+            start = time.perf_counter()
+            
+            with torch.no_grad():
+                for _ in range(iterations):
+                    profile_model(static_x)
+            
+            torch.cuda.synchronize()
+            
+            normal_time = (time.perf_counter() - start) * 1000 / iterations
         
-        torch.cuda.synchronize()
         
-        start = time.perf_counter()
+            # -------------------------
+            # CUDA Graph execution
+            # -------------------------
+            
+            torch.cuda.synchronize()
         
-        with torch.no_grad():
+            start = time.perf_counter()
+            
             for _ in range(iterations):
-                profile_model(static_x)
-        
-        torch.cuda.synchronize()
-        
-        normal_time = (time.perf_counter() - start) * 1000 / iterations
-        
-        
-        # -------------------------
-        # CUDA Graph execution
-        # -------------------------
-        
-        torch.cuda.synchronize()
-    
-        start = time.perf_counter()
-        
-        for _ in range(iterations):
-            graph.replay()
-        
-        torch.cuda.synchronize()
-        
-        graph_time = (time.perf_counter() - start) * 1000 / iterations
-        
-        
-        print("\n========== CUDA GRAPH BENCHMARK ==========")
-        print(f"Normal execution : {normal_time:.6f} ms")
-        print(f"CUDA Graph       : {graph_time:.6f} ms")
-        print(f"Speedup          : {normal_time / graph_time:.2f}x")
-        print(f"Reduction        : {(1 - graph_time / normal_time) * 100:.2f}%")
+                graph.replay()
+            
+            torch.cuda.synchronize()
+            
+            graph_time = (time.perf_counter() - start) * 1000 / iterations
+
+            normal_times.append(normal_time)
+            graph_times.append(graph_time)
+            
+            
+            print("\n========== CUDA GRAPH BENCHMARK ==========")
+            print(f"Trial {trial + 1}/{benchmark_trials}")
+            print(f"Iterations       : {iterations}")
+            print(f"Normal execution : {normal_time:.6f} ms")
+            print(f"CUDA Graph       : {graph_time:.6f} ms")
+            print(f"Speedup          : {normal_time / graph_time:.2f}x")
+            print(f"Reduction        : {(1 - graph_time / normal_time) * 100:.2f}%")
+
+        median_normal = statistics.median(normal_times)
+        median_graph = statistics.median(graph_times)
+
+        speedup = median_normal / median_graph
+        reduction = (1 - median_graph / median_normal) * 100
+
+        overhead_gap = median_normal - median_graph
+
+        gap_per_loop = overhead_gap / loops
+
+
+        print("\n========== MEDIAN RESULT ==========")
+        print(f"Normal execution : {median_normal:.6f} ms")
+        print(f"CUDA Graph       : {median_graph:.6f} ms")
+        print(f"Speedup          : {speedup:.2f}x")
+        print(f"Reduction        : {reduction:.2f}%")
+        print(f"Execution gap    : {overhead_gap:.6f} ms")
+        print(f"Gap per loop     : {gap_per_loop:.6f} ms")
 
         if loops == 8:
             print("\n========== 8-LOOP PROFILER ==========")
