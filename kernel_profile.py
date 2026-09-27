@@ -71,13 +71,14 @@ def main():
     # --------------------------------------------------
 
     with profile(
-        activities=[
-            ProfilerActivity.CPU,
-            ProfilerActivity.CUDA
-        ],
-        record_shapes=True,
-        profile_memory=False,
-        with_stack=False
+    activities=[
+        ProfilerActivity.CPU,
+        ProfilerActivity.CUDA
+    ],
+    record_shapes=True,
+    profile_memory=False,
+    with_stack=False,
+    with_flops=False
     ) as prof:
 
         with torch.no_grad():
@@ -109,16 +110,46 @@ def main():
     print("=" * 100)
 
     events = prof.events()
+    print("\n" + "=" * 100)
+    print("EVENT TYPES")
+    print("=" * 100)
+
+    event_types = {}
+
+    for event in events:
+
+        event_type = str(event.device_type)
+
+        if event_type not in event_types:
+            event_types[event_type] = 0
+
+        event_types[event_type] += 1
+
+    for event_type, count in event_types.items():
+        print(f"{event_type}: {count}")
 
     print("Total profiler events:", len(events))
+
+    # for i, event in enumerate(events):
+
+    #     print(
+    #         f"{i:4d} | "
+    #         f"{event.name:60s} | "
+    #         f"CPU total: {event.cpu_time_total:10.3f} us | "
+    #         f"CUDA total: {event.cuda_time_total:10.3f} us"
+    #     )
+
+    print("\n" + "=" * 100)
+    print("DEVICE EVENTS")
+    print("=" * 100)
 
     for i, event in enumerate(events):
 
         print(
             f"{i:4d} | "
             f"{event.name:60s} | "
-            f"CPU total: {event.cpu_time_total:10.3f} us | "
-            f"CUDA total: {event.cuda_time_total:10.3f} us"
+            f"Device time: {event.device_time_total:10.3f} us | "
+            f"CPU time: {event.cpu_time_total:10.3f} us"
         )
 
     # --------------------------------------------------
