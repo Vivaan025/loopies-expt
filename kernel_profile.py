@@ -39,14 +39,16 @@ def main():
 
     loops = 8
 
-    model = LoopTransformer(loops=loops).to(device)
+    model = LoopTransformer(loops=loops).to(device, dtype=torch.bfloat16)
+    model = torch.compile(model)   # fuse kernels, eliminate launch overhead
     model.eval()
 
     x = torch.randn(
-        8,
-        128,
-        8,
-        device=device
+        8,    # batch size
+        128,  # sequence length
+        256,  # d_model — must match TransformerBlock
+        device=device,
+        dtype=torch.bfloat16  # BF16: native on Blackwell, ~2x GEMM throughput
     )
 
     print("Input shape:", x.shape)

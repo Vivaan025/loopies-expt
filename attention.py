@@ -97,7 +97,7 @@ import torch.nn as nn
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model=8, n_heads=2):
+    def __init__(self, d_model=256, n_heads=8):
         super().__init__()
 
         self.attention = nn.MultiheadAttention(
@@ -109,9 +109,9 @@ class TransformerBlock(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
 
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, 16),
-            nn.ReLU(),
-            nn.Linear(16, d_model)
+            nn.Linear(d_model, d_model * 4),  # 256 -> 1024
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model)   # 1024 -> 256
         )
 
         self.norm2 = nn.LayerNorm(d_model)
