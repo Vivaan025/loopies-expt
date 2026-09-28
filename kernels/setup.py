@@ -21,6 +21,7 @@ setup(
             sources=[
                 "binding.cpp",
                 "layernorm_kernel.cu",
+                "fused_ln_qkv.cu",
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
