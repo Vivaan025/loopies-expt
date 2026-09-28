@@ -82,12 +82,70 @@ def main():
     print("\nWarm-up complete.")
     print("Starting profiler...\n")
 
-    # Capture only this forward
-    torch.cuda.profiler.start()
+    # --------------------------------------------------
+    # Baseline latency (torch.compile, no CUDA Graph)
+    # --------------------------------------------------
 
+    ITERATIONS = 200
+
+    # timed run — compile is already warm
+    torch.cuda.synchronize()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event   = torch.cuda.Event(enable_timing=True)
+
+    start_event.record()
+    with torch.no_grad():
+        for _ in range(ITERATIONS):
+            model(x)
+    end_event.record()
+    torch.cuda.synchronize()
+
+    baseline_ms = start_event.elapsed_time(end_event) / ITERATIONS
+    print(f"Baseline (torch.compile, BF16) : {baseline_ms:.4f} ms / forward")
+
+    # --------------------------------------------------
+    # CUDA Graph latency
+    # --------------------------------------------------
+
+    # CUDA Graphs require a STATIC input tensor — copy x into it once,
+    # then replay will always operate on that same memory.
+    static_x = x.clone()
+
+    # Warm the graph capture (must run at least once outside the capture)
+    with torch.no_grad():
+        for _ in range(3):
+            model(static_x)
+    torch.cuda.synchronize()
+
+    # Capture
+    g = torch.cuda.CUDAGraph()
+    with torch.no_grad():
+        with torch.cuda.graph(g):
+            static_out = model(static_x)
+    torch.cuda.synchronize()
+    print("CUDA Graph captured.")
+
+    # Benchmark replay
+    start_event2 = torch.cuda.Event(enable_timing=True)
+    end_event2   = torch.cuda.Event(enable_timing=True)
+
+    start_event2.record()
+    for _ in range(ITERATIONS):
+        g.replay()
+    end_event2.record()
+    torch.cuda.synchronize()
+
+    graph_ms = start_event2.elapsed_time(end_event2) / ITERATIONS
+    print(f"CUDA Graph                     : {graph_ms:.4f} ms / forward")
+    print(f"Speedup (Graph / Baseline)     : {baseline_ms / graph_ms:.2f}x")
+
+    # --------------------------------------------------
+    # nsys capture: one compiled forward (no graph)
+    # --------------------------------------------------
+
+    torch.cuda.profiler.start()
     with torch.no_grad():
         model(x)
-
     torch.cuda.synchronize()
     torch.cuda.profiler.stop()
 
