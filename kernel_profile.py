@@ -40,13 +40,14 @@ def main():
     # --------------------------------------------------
     # GPU diagnostics
     # --------------------------------------------------
-    gpu_name  = torch.cuda.get_device_name(0)
-    total_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
-    free_mem  = (torch.cuda.get_device_properties(0).total_memory
-                 - torch.cuda.memory_allocated()) / 1024**3
+    gpu_name          = torch.cuda.get_device_name(0)
+    free_bytes, total = torch.cuda.mem_get_info(0)   # actual free from CUDA
+    free_mem          = free_bytes  / 1024**3
+    total_mem         = total       / 1024**3
+    used_mem          = total_mem - free_mem
     print(f"GPU          : {gpu_name}")
     print(f"VRAM total   : {total_mem:.1f} GB")
-    print(f"VRAM free    : {free_mem:.2f} GB")
+    print(f"VRAM used    : {used_mem:.2f} GB  (by ALL processes)")
 
     torch.cuda.empty_cache()
 
