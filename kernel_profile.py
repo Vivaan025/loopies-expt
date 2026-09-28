@@ -66,6 +66,15 @@ def main():
     print("\nWarm-up complete.")
     print("Starting profiler...\n")
 
+    # Capture only this forward
+    torch.cuda.profiler.start()
+
+    with torch.no_grad():
+        model(x)
+
+    torch.cuda.synchronize()
+    torch.cuda.profiler.stop()
+
     # --------------------------------------------------
     # Profiler
     # --------------------------------------------------
