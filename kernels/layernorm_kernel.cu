@@ -22,6 +22,31 @@
 
 
 // ============================================================
+// Portable BF16 ↔ FP32 conversion helpers
+//
+// PyTorch's build system defines __CUDA_NO_BFLOAT16_CONVERSIONS__
+// which disables __bfloat162float() and __float2bfloat16().
+// These helpers always work.
+// ============================================================
+__device__ __forceinline__ float bf16_to_float(__nv_bfloat16 val) {
+    // BF16 is just the upper 16 bits of FP32
+    unsigned int bits = static_cast<unsigned int>(*reinterpret_cast<const unsigned short*>(&val)) << 16;
+    return *reinterpret_cast<float*>(&bits);
+}
+
+__device__ __forceinline__ __nv_bfloat16 float_to_bf16(float val) {
+    // Truncate lower 16 bits (round-to-nearest-even would be better,
+    // but truncation matches __float2bfloat16_rn for most values)
+    unsigned int bits = *reinterpret_cast<unsigned int*>(&val);
+    // Round to nearest even
+    unsigned int rounding_bias = ((bits >> 16) & 1) + 0x7FFF;
+    bits += rounding_bias;
+    unsigned short result = static_cast<unsigned short>(bits >> 16);
+    return *reinterpret_cast<__nv_bfloat16*>(&result);
+}
+
+
+// ============================================================
 // Warp-level reduction: sum 32 values using shuffle
 // ============================================================
 __device__ __forceinline__ float warp_reduce_sum(float val) {
@@ -124,6 +149,9 @@ __global__ void layernorm_fp32_kernel(
 
 // ============================================================
 // LayerNorm kernel — BF16 input/output, FP32 accumulation
+//
+// Note: PyTorch's build system defines __CUDA_NO_BFLOAT16_CONVERSIONS__
+// so we use explicit float conversions instead of __bfloat162float().
 // ============================================================
 __global__ void layernorm_bf16_kernel(
     const __nv_bfloat16* __restrict__ X,
@@ -142,7 +170,7 @@ __global__ void layernorm_bf16_kernel(
     if (row >= N || i >= D) return;
 
     // Load and convert to FP32 for accumulation
-    float x_val = __bfloat162float(X[row * D + i]);
+    float x_val = bf16_to_float(X[row * D + i]);
 
     // --- Compute mean ---
     float sum = block_reduce_sum(x_val, smem);
@@ -157,12 +185,12 @@ __global__ void layernorm_bf16_kernel(
     float x_hat = diff / sqrtf(var + eps);
 
     // --- Affine transform (load gamma/beta as FP32) ---
-    float g = __bfloat162float(gamma[i]);
-    float b = __bfloat162float(beta[i]);
+    float g = bf16_to_float(gamma[i]);
+    float b = bf16_to_float(beta[i]);
     float y_val = g * x_hat + b;
 
     // --- Store as BF16 ---
-    Y[row * D + i] = __float2bfloat16(y_val);
+    Y[row * D + i] = float_to_bf16(y_val);
 }
 
 

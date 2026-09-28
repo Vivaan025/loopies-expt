@@ -6,6 +6,7 @@
  */
 
 #include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
@@ -52,7 +53,7 @@ torch::Tensor custom_layernorm(
     auto Y = torch::empty_like(X_flat);
 
     // Get current CUDA stream
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     // Dispatch by dtype
     if (X.dtype() == torch::kFloat32) {
