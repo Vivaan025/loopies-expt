@@ -1,21 +1,25 @@
 /*
- * Phase 4 — Fused LayerNorm + QKV Projection kernel.
+ * Phase 5 — Optimized Fused LayerNorm + QKV Projection kernel.
  *
- * This is a CORRECTNESS PROTOTYPE. It is intentionally simple:
- *   - One block per row (per token)
- *   - 256 threads per block (one per feature)
- *   - After LayerNorm, x_norm stays in shared memory
- *   - Each thread computes 3 output values (Q_i, K_i, V_i) via dot product
+ * Improvements over Phase 4 (correctness prototype):
+ *   - Warp-parallel GEMV: each warp cooperatively computes one dot product
+ *     with coalesced global memory reads (vs Phase 4's strided reads)
+ *   - 32× reduction in memory amplification for weight reads
+ *   - No __syncthreads in the GEMV phase (only warp-level shuffles)
  *
- * The key benefit: x_norm is NEVER written to global memory (DRAM).
- * It goes from registers → shared memory → dot product → output.
+ * Design:
+ *   - One block per row (token), 256 threads = 8 warps
+ *   - Phase 1: LayerNorm with warp/block reduction → x_norm in shared memory
+ *   - Phase 2: Warp-parallel GEMV
+ *     - Each warp handles one output column per iteration
+ *     - 8 columns processed simultaneously (one per warp)
+ *     - 768 / 8 = 96 outer iterations
+ *     - Per iteration: each thread loads D/32 = 8 weight values (coalesced)
+ *     - Warp shuffle reduction → lane 0 has the full dot product
  *
- * Performance notes:
- *   - The dot product loop (D iterations per output) has no weight reuse
- *     between threads and does not use Tensor Cores.
- *   - This is NOT expected to beat cuBLAS/CUTLASS for the GEMM portion.
- *   - The paper contribution is the eliminated DRAM round-trip for x_norm.
- *   - A tiled version (Phase 5) would address GEMM efficiency.
+ * Memory access pattern:
+ *   Phase 4: threads in warp read W[col0*D+k], W[col1*D+k], ... (stride D)
+ *   Phase 5: threads in warp read W[col*D+0], W[col*D+1], ... (contiguous)
  *
  * Input:   X       (N, D)     — pre-norm activations
  *          gamma   (D,)       — LayerNorm weight
@@ -30,7 +34,7 @@
 
 
 // ============================================================
-// Portable BF16 ↔ FP32 conversion helpers (same as layernorm_kernel.cu)
+// Portable BF16 ↔ FP32 conversion helpers
 // ============================================================
 __device__ __forceinline__ float bf16_to_fp32(__nv_bfloat16 val) {
     unsigned int bits = static_cast<unsigned int>(
@@ -48,7 +52,7 @@ __device__ __forceinline__ __nv_bfloat16 fp32_to_bf16(float val) {
 
 
 // ============================================================
-// Warp-level sum reduction
+// Warp-level sum reduction (lane 0 gets the result)
 // ============================================================
 __device__ __forceinline__ float warp_sum(float val) {
     const unsigned int mask = 0xFFFFFFFF;
@@ -62,8 +66,7 @@ __device__ __forceinline__ float warp_sum(float val) {
 
 
 // ============================================================
-// Block-level sum reduction using shared memory
-// smem must have at least (blockDim.x / 32) floats available
+// Block-level sum reduction for LayerNorm
 // ============================================================
 __device__ float block_sum(float val, float* smem) {
     const int lane  = threadIdx.x % 32;
@@ -86,76 +89,99 @@ __device__ float block_sum(float val, float* smem) {
 
 
 // ============================================================
-// Fused LayerNorm + QKV kernel — FP32
+// Fused LayerNorm + QKV kernel — FP32 (Phase 5: warp-parallel GEMV)
 // ============================================================
 //
 // Shared memory layout:
-//   smem[0 .. 31]:      reduction scratch (up to 32 warps)
-//   smem[32 .. 32+D-1]: x_norm storage for dot product
+//   smem[0 .. 31]:      reduction scratch
+//   smem[32 .. 32+D-1]: x_norm for GEMV reads
 //
 __global__ void fused_ln_qkv_fp32_kernel(
-    const float* __restrict__ X,        // (N, D)
-    const float* __restrict__ gamma,    // (D,)
-    const float* __restrict__ beta,     // (D,)
-    const float* __restrict__ W_qkv,    // (3D, D) — row-major
-    const float* __restrict__ b_qkv,    // (3D,)
-          float* __restrict__ OUT,      // (N, 3D)
+    const float* __restrict__ X,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    const float* __restrict__ W_qkv,
+    const float* __restrict__ b_qkv,
+          float* __restrict__ OUT,
     int N,
     int D,
     float eps
 ) {
     extern __shared__ float smem_raw[];
 
-    // Separate regions to avoid reuse hazards
-    float* reduce_smem = smem_raw;           // [0..31]  for reductions
-    float* xnorm_smem  = smem_raw + 32;     // [32..32+D-1] for x_norm
+    float* reduce_smem = smem_raw;
+    float* xnorm_smem  = smem_raw + 32;
 
-    const int row = blockIdx.x;
-    const int i   = threadIdx.x;
+    const int row     = blockIdx.x;
+    const int tid     = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    const int NUM_WARPS = blockDim.x / 32;   // = 8 for D=256
 
-    if (row >= N || i >= D) return;
+    if (row >= N || tid >= D) return;
 
-    // ---- Step 1: Load input ----
-    float x_val = X[row * D + i];
+    // ================================================================
+    // Phase 1: LayerNorm
+    // ================================================================
 
-    // ---- Step 2: Compute mean ----
+    float x_val = X[row * D + tid];
+
+    // Mean
     float mean = block_sum(x_val, reduce_smem) / (float)D;
 
-    // ---- Step 3: Compute variance ----
+    // Variance
     float diff = x_val - mean;
     float var = block_sum(diff * diff, reduce_smem) / (float)D;
 
-    // ---- Step 4: Normalize + affine ----
+    // Normalize + affine → stays on-chip in shared memory
     float x_hat = diff / sqrtf(var + eps);
-    float x_norm = gamma[i] * x_hat + beta[i];
+    float x_norm = gamma[tid] * x_hat + beta[tid];
 
-    // ---- Step 5: Store x_norm in shared memory ----
-    // This is the KEY FUSION POINT: x_norm stays on-chip.
-    // In the unfused path, x_norm would be written to DRAM here
-    // and read back by the QKV projection.
-    xnorm_smem[i] = x_norm;
+    xnorm_smem[tid] = x_norm;
     __syncthreads();
 
-    // ---- Step 6: QKV dot product ----
-    // Thread i computes output columns: i, i+D, i+2D
-    // Each requires a dot product of xnorm_smem[0..D-1] with one row of W_qkv
+    // ================================================================
+    // Phase 2: Warp-parallel GEMV
+    //
+    // Each warp computes one output column per outer iteration.
+    // 8 warps → 8 columns per iteration → 768/8 = 96 iterations.
+    //
+    // Within each warp, 32 threads cooperatively compute one dot product:
+    //   out[col] = sum_k(xnorm[k] * W[col][k]) + bias[col]
+    //
+    // Thread t handles k = t, t+32, t+64, ..., t+224 (8 elements)
+    // Warp reads are COALESCED: thread t reads W[col*D + t], which is
+    // contiguous with thread t+1 reading W[col*D + t+1].
+    // ================================================================
+
     const int D3 = 3 * D;
 
-    for (int j = 0; j < 3; j++) {
-        int out_col = j * D + i;
-        const float* w_row = W_qkv + out_col * D;   // row out_col of W_qkv
+    for (int base_col = 0; base_col < D3; base_col += NUM_WARPS) {
+        int out_col = base_col + warp_id;
 
-        float dot = 0.0f;
-        for (int k = 0; k < D; k++) {
-            dot += xnorm_smem[k] * w_row[k];
+        if (out_col < D3) {
+            const float* w_row = W_qkv + out_col * D;
+
+            // Cooperative dot product: each thread accumulates D/32 partial products
+            float partial = 0.0f;
+            for (int k = lane_id; k < D; k += 32) {
+                partial += xnorm_smem[k] * w_row[k];
+            }
+
+            // Warp-level reduction (only lane 0 gets the full sum)
+            partial = warp_sum(partial);
+
+            // Lane 0 writes the output
+            if (lane_id == 0) {
+                OUT[row * D3 + out_col] = partial + b_qkv[out_col];
+            }
         }
-        OUT[row * D3 + out_col] = dot + b_qkv[out_col];
     }
 }
 
 
 // ============================================================
-// Fused LayerNorm + QKV kernel — BF16
+// Fused LayerNorm + QKV kernel — BF16 (Phase 5: warp-parallel GEMV)
 // ============================================================
 __global__ void fused_ln_qkv_bf16_kernel(
     const __nv_bfloat16* __restrict__ X,
@@ -173,44 +199,61 @@ __global__ void fused_ln_qkv_bf16_kernel(
     float* reduce_smem = smem_raw;
     float* xnorm_smem  = smem_raw + 32;
 
-    const int row = blockIdx.x;
-    const int i   = threadIdx.x;
+    const int row     = blockIdx.x;
+    const int tid     = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    const int NUM_WARPS = blockDim.x / 32;
 
-    if (row >= N || i >= D) return;
+    if (row >= N || tid >= D) return;
 
-    // Load as FP32
-    float x_val = bf16_to_fp32(X[row * D + i]);
+    // ================================================================
+    // Phase 1: LayerNorm (FP32 accumulation)
+    // ================================================================
 
-    // Mean
+    float x_val = bf16_to_fp32(X[row * D + tid]);
+
     float mean = block_sum(x_val, reduce_smem) / (float)D;
 
-    // Variance
     float diff = x_val - mean;
     float var = block_sum(diff * diff, reduce_smem) / (float)D;
 
-    // Normalize + affine
     float x_hat = diff / sqrtf(var + eps);
-    float g = bf16_to_fp32(gamma[i]);
-    float b = bf16_to_fp32(beta[i]);
+    float g = bf16_to_fp32(gamma[tid]);
+    float b = bf16_to_fp32(beta[tid]);
     float x_norm = g * x_hat + b;
 
-    // Store normalized value in shared memory (FP32 for dot product precision)
-    xnorm_smem[i] = x_norm;
+    // Store as FP32 in shared memory for dot product precision
+    xnorm_smem[tid] = x_norm;
     __syncthreads();
 
-    // QKV dot product — accumulate in FP32, store as BF16
+    // ================================================================
+    // Phase 2: Warp-parallel GEMV (FP32 accumulation, BF16 output)
+    // ================================================================
+
     const int D3 = 3 * D;
 
-    for (int j = 0; j < 3; j++) {
-        int out_col = j * D + i;
-        const __nv_bfloat16* w_row = W_qkv + out_col * D;
+    for (int base_col = 0; base_col < D3; base_col += NUM_WARPS) {
+        int out_col = base_col + warp_id;
 
-        float dot = 0.0f;
-        for (int k = 0; k < D; k++) {
-            dot += xnorm_smem[k] * bf16_to_fp32(w_row[k]);
+        if (out_col < D3) {
+            const __nv_bfloat16* w_row = W_qkv + out_col * D;
+
+            // Cooperative dot product with FP32 accumulation
+            float partial = 0.0f;
+            for (int k = lane_id; k < D; k += 32) {
+                partial += xnorm_smem[k] * bf16_to_fp32(w_row[k]);
+            }
+
+            // Warp reduction
+            partial = warp_sum(partial);
+
+            // Lane 0 writes as BF16
+            if (lane_id == 0) {
+                float result = partial + bf16_to_fp32(b_qkv[out_col]);
+                OUT[row * D3 + out_col] = fp32_to_bf16(result);
+            }
         }
-        dot += bf16_to_fp32(b_qkv[out_col]);
-        OUT[row * D3 + out_col] = fp32_to_bf16(dot);
     }
 }
 
@@ -228,7 +271,7 @@ void launch_fused_ln_qkv_fp32(
 ) {
     dim3 grid(N);
     dim3 block(D);
-    int smem_size = (32 + D) * sizeof(float);  // 32 for reduction + D for x_norm
+    int smem_size = (32 + D) * sizeof(float);   // 32 for reduction + D for x_norm
     fused_ln_qkv_fp32_kernel<<<grid, block, smem_size, stream>>>(
         X, gamma, beta, W_qkv, b_qkv, OUT, N, D, eps
     );
@@ -242,7 +285,7 @@ void launch_fused_ln_qkv_bf16(
 ) {
     dim3 grid(N);
     dim3 block(D);
-    int smem_size = (32 + D) * sizeof(float);  // 32 for reduction + D for x_norm   // smem is FP32 even for BF16 path
+    int smem_size = (32 + D) * sizeof(float);   // smem is FP32 even for BF16 path
     fused_ln_qkv_bf16_kernel<<<grid, block, smem_size, stream>>>(
         X, gamma, beta, W_qkv, b_qkv, OUT, N, D, eps
     );
