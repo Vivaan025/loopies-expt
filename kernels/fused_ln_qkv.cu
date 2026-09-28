@@ -89,9 +89,9 @@ __device__ float block_sum(float val, float* smem) {
 // Fused LayerNorm + QKV kernel — FP32
 // ============================================================
 //
-// Shared memory layout (D floats):
-//   Phase 1 (reduction):  smem[0..nwarps-1] used for cross-warp sums
-//   Phase 2 (dot product): smem[0..D-1] stores x_norm for all threads to read
+// Shared memory layout:
+//   smem[0 .. 31]:      reduction scratch (up to 32 warps)
+//   smem[32 .. 32+D-1]: x_norm storage for dot product
 //
 __global__ void fused_ln_qkv_fp32_kernel(
     const float* __restrict__ X,        // (N, D)
@@ -104,8 +104,11 @@ __global__ void fused_ln_qkv_fp32_kernel(
     int D,
     float eps
 ) {
-    // Shared memory: D floats (enough for both reduction scratch and x_norm)
-    extern __shared__ float smem[];
+    extern __shared__ float smem_raw[];
+
+    // Separate regions to avoid reuse hazards
+    float* reduce_smem = smem_raw;           // [0..31]  for reductions
+    float* xnorm_smem  = smem_raw + 32;     // [32..32+D-1] for x_norm
 
     const int row = blockIdx.x;
     const int i   = threadIdx.x;
@@ -116,11 +119,11 @@ __global__ void fused_ln_qkv_fp32_kernel(
     float x_val = X[row * D + i];
 
     // ---- Step 2: Compute mean ----
-    float mean = block_sum(x_val, smem) / (float)D;
+    float mean = block_sum(x_val, reduce_smem) / (float)D;
 
     // ---- Step 3: Compute variance ----
     float diff = x_val - mean;
-    float var = block_sum(diff * diff, smem) / (float)D;
+    float var = block_sum(diff * diff, reduce_smem) / (float)D;
 
     // ---- Step 4: Normalize + affine ----
     float x_hat = diff / sqrtf(var + eps);
@@ -130,12 +133,12 @@ __global__ void fused_ln_qkv_fp32_kernel(
     // This is the KEY FUSION POINT: x_norm stays on-chip.
     // In the unfused path, x_norm would be written to DRAM here
     // and read back by the QKV projection.
-    smem[i] = x_norm;
+    xnorm_smem[i] = x_norm;
     __syncthreads();
 
     // ---- Step 6: QKV dot product ----
     // Thread i computes output columns: i, i+D, i+2D
-    // Each requires a dot product of smem[0..D-1] with one row of W_qkv
+    // Each requires a dot product of xnorm_smem[0..D-1] with one row of W_qkv
     const int D3 = 3 * D;
 
     for (int j = 0; j < 3; j++) {
@@ -144,7 +147,7 @@ __global__ void fused_ln_qkv_fp32_kernel(
 
         float dot = 0.0f;
         for (int k = 0; k < D; k++) {
-            dot += smem[k] * w_row[k];
+            dot += xnorm_smem[k] * w_row[k];
         }
         OUT[row * D3 + out_col] = dot + b_qkv[out_col];
     }
@@ -165,7 +168,10 @@ __global__ void fused_ln_qkv_bf16_kernel(
     int D,
     float eps
 ) {
-    extern __shared__ float smem[];
+    extern __shared__ float smem_raw[];
+
+    float* reduce_smem = smem_raw;
+    float* xnorm_smem  = smem_raw + 32;
 
     const int row = blockIdx.x;
     const int i   = threadIdx.x;
@@ -176,11 +182,11 @@ __global__ void fused_ln_qkv_bf16_kernel(
     float x_val = bf16_to_fp32(X[row * D + i]);
 
     // Mean
-    float mean = block_sum(x_val, smem) / (float)D;
+    float mean = block_sum(x_val, reduce_smem) / (float)D;
 
     // Variance
     float diff = x_val - mean;
-    float var = block_sum(diff * diff, smem) / (float)D;
+    float var = block_sum(diff * diff, reduce_smem) / (float)D;
 
     // Normalize + affine
     float x_hat = diff / sqrtf(var + eps);
@@ -189,7 +195,7 @@ __global__ void fused_ln_qkv_bf16_kernel(
     float x_norm = g * x_hat + b;
 
     // Store normalized value in shared memory (FP32 for dot product precision)
-    smem[i] = x_norm;
+    xnorm_smem[i] = x_norm;
     __syncthreads();
 
     // QKV dot product — accumulate in FP32, store as BF16
@@ -201,7 +207,7 @@ __global__ void fused_ln_qkv_bf16_kernel(
 
         float dot = 0.0f;
         for (int k = 0; k < D; k++) {
-            dot += smem[k] * bf16_to_fp32(w_row[k]);
+            dot += xnorm_smem[k] * bf16_to_fp32(w_row[k]);
         }
         dot += bf16_to_fp32(b_qkv[out_col]);
         OUT[row * D3 + out_col] = fp32_to_bf16(dot);
@@ -222,7 +228,7 @@ void launch_fused_ln_qkv_fp32(
 ) {
     dim3 grid(N);
     dim3 block(D);
-    int smem_size = D * sizeof(float);
+    int smem_size = (32 + D) * sizeof(float);  // 32 for reduction + D for x_norm
     fused_ln_qkv_fp32_kernel<<<grid, block, smem_size, stream>>>(
         X, gamma, beta, W_qkv, b_qkv, OUT, N, D, eps
     );
@@ -236,7 +242,7 @@ void launch_fused_ln_qkv_bf16(
 ) {
     dim3 grid(N);
     dim3 block(D);
-    int smem_size = D * sizeof(float);   // smem is FP32 even for BF16 path
+    int smem_size = (32 + D) * sizeof(float);  // 32 for reduction + D for x_norm   // smem is FP32 even for BF16 path
     fused_ln_qkv_bf16_kernel<<<grid, block, smem_size, stream>>>(
         X, gamma, beta, W_qkv, b_qkv, OUT, N, D, eps
     );

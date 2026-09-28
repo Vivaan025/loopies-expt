@@ -27,7 +27,6 @@ setup(
                 "cxx": ["-O3"],
                 "nvcc": [
                     "-O3",
-                    "--use_fast_math",
                 ],
             },
         ),
