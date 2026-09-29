@@ -141,40 +141,58 @@ __global__ void fused_ln_qkv_fp32_kernel(
     __syncthreads();
 
     // ================================================================
-    // Phase 2: Warp-parallel GEMV
+    // Phase 2: Warp-parallel GEMV with register blocking
     //
-    // Each warp computes one output column per outer iteration.
-    // 8 warps → 8 columns per iteration → 768/8 = 96 iterations.
+    // Each warp processes COLS_PER_WARP output columns simultaneously.
+    // 8 warps × 4 cols = 32 columns per outer iteration → 768/32 = 24 iters.
     //
-    // Within each warp, 32 threads cooperatively compute one dot product:
-    //   out[col] = sum_k(xnorm[k] * W[col][k]) + bias[col]
+    // For each inner k iteration, one xnorm_smem[k] read is amortized
+    // across 4 weight reads and 4 FMAs → better instruction-level parallelism.
     //
-    // Thread t handles k = t, t+32, t+64, ..., t+224 (8 elements)
-    // Warp reads are COALESCED: thread t reads W[col*D + t], which is
-    // contiguous with thread t+1 reading W[col*D + t+1].
+    // Warp reads remain COALESCED within each weight row.
     // ================================================================
 
     const int D3 = 3 * D;
+    const int COLS_PER_WARP = 4;
+    const int COLS_PER_ITER = NUM_WARPS * COLS_PER_WARP;  // 32
 
-    for (int base_col = 0; base_col < D3; base_col += NUM_WARPS) {
-        int out_col = base_col + warp_id;
+    for (int base_col = 0; base_col < D3; base_col += COLS_PER_ITER) {
 
-        if (out_col < D3) {
-            const float* w_row = W_qkv + out_col * D;
+        // Each warp handles 4 consecutive columns
+        int col0 = base_col + warp_id * COLS_PER_WARP;
 
-            // Cooperative dot product: each thread accumulates D/32 partial products
-            float partial = 0.0f;
-            for (int k = lane_id; k < D; k += 32) {
-                partial += xnorm_smem[k] * w_row[k];
-            }
+        // Initialize 4 partial sums in registers
+        float partial0 = 0.0f, partial1 = 0.0f;
+        float partial2 = 0.0f, partial3 = 0.0f;
 
-            // Warp-level reduction (only lane 0 gets the full sum)
-            partial = warp_sum(partial);
+        // Pointers to 4 weight rows
+        const float* w0 = W_qkv + (col0 + 0) * D;
+        const float* w1 = W_qkv + (col0 + 1) * D;
+        const float* w2 = W_qkv + (col0 + 2) * D;
+        const float* w3 = W_qkv + (col0 + 3) * D;
 
-            // Lane 0 writes the output
-            if (lane_id == 0) {
-                OUT[row * D3 + out_col] = partial + b_qkv[out_col];
-            }
+        // Cooperative dot product: each thread handles D/32 k-values
+        for (int k = lane_id; k < D; k += 32) {
+            float xn = xnorm_smem[k];       // 1 smem read, reused 4×
+            partial0 += xn * w0[k];          // 4 coalesced global reads
+            partial1 += xn * w1[k];
+            partial2 += xn * w2[k];
+            partial3 += xn * w3[k];
+        }
+
+        // 4 independent warp reductions
+        partial0 = warp_sum(partial0);
+        partial1 = warp_sum(partial1);
+        partial2 = warp_sum(partial2);
+        partial3 = warp_sum(partial3);
+
+        // Lane 0 stores 4 outputs
+        if (lane_id == 0) {
+            float* out_row = OUT + row * D3;
+            out_row[col0 + 0] = partial0 + b_qkv[col0 + 0];
+            out_row[col0 + 1] = partial1 + b_qkv[col0 + 1];
+            out_row[col0 + 2] = partial2 + b_qkv[col0 + 2];
+            out_row[col0 + 3] = partial3 + b_qkv[col0 + 3];
         }
     }
 }
@@ -228,31 +246,44 @@ __global__ void fused_ln_qkv_bf16_kernel(
     __syncthreads();
 
     // ================================================================
-    // Phase 2: Warp-parallel GEMV (FP32 accumulation, BF16 output)
+    // Phase 2: Warp-parallel GEMV with register blocking (BF16)
     // ================================================================
 
     const int D3 = 3 * D;
+    const int COLS_PER_WARP = 4;
+    const int COLS_PER_ITER = NUM_WARPS * COLS_PER_WARP;
 
-    for (int base_col = 0; base_col < D3; base_col += NUM_WARPS) {
-        int out_col = base_col + warp_id;
+    for (int base_col = 0; base_col < D3; base_col += COLS_PER_ITER) {
 
-        if (out_col < D3) {
-            const __nv_bfloat16* w_row = W_qkv + out_col * D;
+        int col0 = base_col + warp_id * COLS_PER_WARP;
 
-            // Cooperative dot product with FP32 accumulation
-            float partial = 0.0f;
-            for (int k = lane_id; k < D; k += 32) {
-                partial += xnorm_smem[k] * bf16_to_fp32(w_row[k]);
-            }
+        float partial0 = 0.0f, partial1 = 0.0f;
+        float partial2 = 0.0f, partial3 = 0.0f;
 
-            // Warp reduction
-            partial = warp_sum(partial);
+        const __nv_bfloat16* w0 = W_qkv + (col0 + 0) * D;
+        const __nv_bfloat16* w1 = W_qkv + (col0 + 1) * D;
+        const __nv_bfloat16* w2 = W_qkv + (col0 + 2) * D;
+        const __nv_bfloat16* w3 = W_qkv + (col0 + 3) * D;
 
-            // Lane 0 writes as BF16
-            if (lane_id == 0) {
-                float result = partial + bf16_to_fp32(b_qkv[out_col]);
-                OUT[row * D3 + out_col] = fp32_to_bf16(result);
-            }
+        for (int k = lane_id; k < D; k += 32) {
+            float xn = xnorm_smem[k];
+            partial0 += xn * bf16_to_fp32(w0[k]);
+            partial1 += xn * bf16_to_fp32(w1[k]);
+            partial2 += xn * bf16_to_fp32(w2[k]);
+            partial3 += xn * bf16_to_fp32(w3[k]);
+        }
+
+        partial0 = warp_sum(partial0);
+        partial1 = warp_sum(partial1);
+        partial2 = warp_sum(partial2);
+        partial3 = warp_sum(partial3);
+
+        if (lane_id == 0) {
+            __nv_bfloat16* out_row = OUT + row * D3;
+            out_row[col0 + 0] = fp32_to_bf16(partial0 + bf16_to_fp32(b_qkv[col0 + 0]));
+            out_row[col0 + 1] = fp32_to_bf16(partial1 + bf16_to_fp32(b_qkv[col0 + 1]));
+            out_row[col0 + 2] = fp32_to_bf16(partial2 + bf16_to_fp32(b_qkv[col0 + 2]));
+            out_row[col0 + 3] = fp32_to_bf16(partial3 + bf16_to_fp32(b_qkv[col0 + 3]));
         }
     }
 }
