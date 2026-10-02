@@ -23,7 +23,7 @@ class ExplicitTransformerBlock(nn.Module):
     QKV weights can be copied from nn.MultiheadAttention's in_proj_weight/bias.
     """
 
-    def __init__(self, d_model=256, n_heads=8):
+    def __init__(self, d_model=256, n_heads=8, causal=False):
         super().__init__()
 
         assert d_model % n_heads == 0, \
@@ -32,6 +32,7 @@ class ExplicitTransformerBlock(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.causal = causal
 
         # Exposed QKV projection — packed [Q, K, V] like nn.MHA's in_proj
         self.qkv_proj = nn.Linear(d_model, 3 * d_model)
@@ -63,7 +64,7 @@ class ExplicitTransformerBlock(nn.Module):
         Q, K, V = qkv.unbind(dim=0)                               # each: (B, H, S, hd)
 
         # 2. Scaled dot-product attention
-        attn_out = F.scaled_dot_product_attention(Q, K, V)         # (B, H, S, hd)
+        attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=self.causal)       # (B, H, S, hd)
 
         # 3. Reshape back and output projection
         attn_out = attn_out.transpose(1, 2).reshape(B, S, D)      # (B, S, D)
