@@ -58,11 +58,24 @@ ALL_TARGETS = tuple(TARGETS)
 # ============================================================
 
 def load_huginn(device):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    """Load Huginn with its own modeling code (trust_remote_code).
+
+    The repo's code targets transformers 4.44; transformers 5 expects
+    `_tied_weights_keys` to be a {target: source} dict rather than a list,
+    so the class is patched at runtime before loading. Nothing on disk changes.
+    """
+    from transformers import AutoTokenizer
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    cls = get_class_from_dynamic_module("raven_modeling_minimal.RavenForCausalLM", MODEL_ID)
+    if isinstance(cls._tied_weights_keys, list):
+        cls._tied_weights_keys = {"lm_head.weight": "transformer.wte.weight"}
+
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, torch_dtype=torch.bfloat16, trust_remote_code=True)
+    model = cls.from_pretrained(MODEL_ID, dtype=torch.bfloat16)
     model.to(device).eval()
+    assert model.lm_head.weight.data_ptr() == model.transformer.wte.weight.data_ptr(), \
+        "embedding / lm_head tie was lost while loading"
     return model, tok
 
 
