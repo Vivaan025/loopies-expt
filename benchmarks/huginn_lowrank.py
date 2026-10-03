@@ -190,7 +190,7 @@ def eval_loss(model, data, num_steps, batch_size, device, seed=1234):
     for b, (x, y) in enumerate(batches(data, batch_size)):
         torch.manual_seed(seed + b)
         out = model(input_ids=x.to(device), labels=y.to(device),
-                    num_steps=torch.tensor(num_steps))
+                    num_steps=num_steps)
         total += out.loss.item() * x.numel()
         n += x.numel()
     return total / n
@@ -230,14 +230,14 @@ def per_step_error(model, comp, rank, data, num_steps, batch_size, device, seed=
         comp.restore()
         rec = StepRecorder(block)
         torch.manual_seed(seed + b)
-        model(input_ids=x, num_steps=torch.tensor(num_steps))
+        model(input_ids=x, num_steps=num_steps)
         rec.remove()
 
         comp.apply(rank)
         cmp = StepRecorder(block)
         cmp.ref, cmp.errs, cmp._t = rec.states, errs, 0
         torch.manual_seed(seed + b)
-        model(input_ids=x, num_steps=torch.tensor(num_steps))
+        model(input_ids=x, num_steps=num_steps)
         cmp.remove()
 
         del rec
@@ -350,7 +350,7 @@ def stage_recover(model, comp, train_data, val_data, args):
                 it += 1
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     out_ = model(input_ids=row[:, :-1], labels=row[:, 1:],
-                                 num_steps=(torch.tensor(no_grad), torch.tensor(args.grad_steps)))
+                                 num_steps=(no_grad, args.grad_steps))
                 (out_.loss / args.accum).backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
@@ -379,12 +379,12 @@ def stage_latency(model, comp, args, B=1, S=1024, iters=10, warmup=3):
 
     def run():
         for _ in range(warmup):
-            model(input_ids=x, num_steps=torch.tensor(args.latency_steps))
+            model(input_ids=x, num_steps=args.latency_steps)
         torch.cuda.synchronize()
         a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         a.record()
         for _ in range(iters):
-            model(input_ids=x, num_steps=torch.tensor(args.latency_steps))
+            model(input_ids=x, num_steps=args.latency_steps)
         b.record()
         torch.cuda.synchronize()
         return a.elapsed_time(b) / iters
