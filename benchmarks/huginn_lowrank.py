@@ -28,6 +28,7 @@ import argparse
 import json
 import math
 import os
+from pathlib import Path
 import sys
 import time
 
@@ -340,23 +341,83 @@ def stage_recover(model, comp, train_data, val_data, args):
         warmup = max(1, args.recover_steps // 10)
         t0 = time.perf_counter()
         it = 0
+        best_val = before
+        best_path = None
+
+        def save_factors(step_num, val_loss):
+            nonlocal best_path
+            ckpt_dir = Path(args.out_dir) / "factors"
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            best_path = ckpt_dir / f"factors_r{r}_step{step_num}.pt"
+            torch.save(
+                {k: _proj(comp.blocks[k[0]], k[1]).state_dict() for k in comp.orig},
+                best_path,
+            )
+
         for step in range(args.recover_steps):
             lr = args.recover_lr * min(1.0, (step + 1) / warmup)
             for g in opt.param_groups:
                 g["lr"] = lr
             opt.zero_grad(set_to_none=True)
+            train_loss_sum = 0.0
             for _ in range(args.accum):
                 row = train_data[it % len(train_data)].unsqueeze(0).to(args.device)
                 it += 1
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    out_ = model(input_ids=row[:, :-1], labels=row[:, 1:],
-                                 num_steps=(no_grad, args.grad_steps))
-                (out_.loss / args.accum).backward()
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
+                    result = model(
+                        input_ids=row[:, :-1],
+                        labels=row[:, 1:],
+                        num_steps=(no_grad, args.grad_steps),
+                        use_cache=False,
+                    )
+                train_loss_sum += result.loss.detach().item()
+                (result.loss / args.accum).backward()
+                del result
+            if step == 0:
+                missing = sum(p.grad is None for p in params)
+                print(f"    Parameters without gradients: {missing}/{len(params)}")
+                if missing:
+                    raise RuntimeError("Some intended trainable parameters have no gradient.")
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                params, 1.0, error_if_nonfinite=True
+            )
             opt.step()
-            if step % 25 == 0 or step == args.recover_steps - 1:
-                print(f"    [r={r}] step {step}/{args.recover_steps} loss {out_.loss.item():.4f} "
-                      f"({time.perf_counter() - t0:.0f}s)", flush=True)
+            completed = step + 1
+            if completed % 25 == 0 or completed == args.recover_steps:
+                cuda_device = torch.device(args.device)
+                cuda_index = (
+                    cuda_device.index
+                    if cuda_device.index is not None
+                    else torch.cuda.current_device()
+                )
+                model.eval()
+                model.gradient_checkpointing = False
+                try:
+                    with torch.random.fork_rng(devices=[cuda_index]):
+                        torch.manual_seed(0)
+                        with torch.no_grad(), torch.autocast(
+                            "cuda", dtype=torch.bfloat16
+                        ):
+                            val = float(eval_loss(
+                                model, val_data, s_eval,
+                                args.batch_size, args.device,
+                            ))
+                finally:
+                    model.train()
+                    model.gradient_checkpointing = True
+                if val < best_val:
+                    best_val = val
+                    save_factors(completed, val)
+                print(
+                    f"    [r={r}] update {completed}/{args.recover_steps} "
+                    f"train_avg={train_loss_sum / args.accum:.4f} "
+                    f"val={val:.4f} best={best_val:.4f} "
+                    f"grad_norm={float(grad_norm):.4f} "
+                    f"lr={lr:.2e} "
+                    f"({time.perf_counter() - t0:.0f}s)",
+                    flush=True,
+                )
+        print(f"    Best factor checkpoint: {best_path}", flush=True)
         model.eval()
         model.gradient_checkpointing = False
         for p in params:
@@ -447,6 +508,7 @@ def main():
     print(f"val set: {tuple(val.shape)}", flush=True)
 
     print("\n== SVD of core projections ==")
+    
     comp = CoreCompressor(model, args.targets, max(args.ranks))
     print(f"  core target params: {comp.core_target_params():,}  "
           f"(core total {count_params(model.transformer.core_block):,})")
