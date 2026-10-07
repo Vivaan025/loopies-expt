@@ -531,34 +531,53 @@ def stage_recover(model, comp, train_data, val_data, args):
 
 @torch.no_grad()
 def stage_latency(model, comp, args, B=1, S=1024, iters=10, warmup=3):
+    steps_list = args.steps
     print("\n" + "=" * 78)
-    print(f"FORWARD LATENCY  (B={B}, S={S}, bf16, eager, num_steps={args.latency_steps})")
+    print(f"FORWARD LATENCY  (B={B}, S={S}, bf16, eager, num_steps={steps_list})")
     print("=" * 78)
     x = torch.randint(0, 65000, (B, S), device=args.device)
 
-    def run():
+    def run(ns):
         for _ in range(warmup):
-            model(input_ids=x, num_steps=args.latency_steps)
+            model(input_ids=x, num_steps=ns)
         torch.cuda.synchronize()
         a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         a.record()
         for _ in range(iters):
-            model(input_ids=x, num_steps=args.latency_steps)
+            model(input_ids=x, num_steps=ns)
         b.record()
         torch.cuda.synchronize()
         return a.elapsed_time(b) / iters
 
+    header = f"  {'model':>12} {'params':>10} | " + " ".join(f"{'s=' + str(s):>8}" for s in steps_list)
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    rows = []
+
+    # Full model at all step counts
     comp.restore()
-    base = run()
-    rows = [dict(rank="full", ms=base, params=count_params(model))]
-    print(f"  {'full':>6}: {base:8.1f} ms   ({count_params(model) / 1e9:.2f}B params)", flush=True)
+    full_ms = {}
+    for ns in steps_list:
+        full_ms[ns] = run(ns)
+    rows.append(dict(rank="full", params=count_params(model), ms=full_ms))
+    print(f"  {'full':>12} {count_params(model) / 1e9:>9.2f}B | " +
+          " ".join(f"{full_ms[s]:>7.1f}ms" for s in steps_list), flush=True)
+
+    # Compressed at all step counts
     for r in args.ranks:
         comp.apply(r)
-        ms = run()
-        rows.append(dict(rank=r, ms=ms, params=count_params(model)))
-        print(f"  {r:>6}: {ms:8.1f} ms   ({count_params(model) / 1e9:.2f}B params)  "
-              f"{base / ms:.2f}x", flush=True)
-    comp.restore()
+        comp_ms = {}
+        for ns in steps_list:
+            comp_ms[ns] = run(ns)
+        rows.append(dict(rank=r, params=count_params(model), ms=comp_ms))
+        print(f"  {f'r={r}':>12} {count_params(model) / 1e9:>9.2f}B | " +
+              " ".join(f"{comp_ms[s]:>7.1f}ms" for s in steps_list), flush=True)
+        # Speedup row
+        print(f"  {'speedup':>12} {'':>10} | " +
+              " ".join(f"{full_ms[s] / comp_ms[s]:>7.2f}x" for s in steps_list), flush=True)
+        comp.restore()
+
     return rows
 
 
