@@ -313,15 +313,37 @@ def stage_error(model, comp, data, args):
 
 
 def stage_recover(model, comp, train_data, val_data, args):
+    step_offset = getattr(args, 'start_step', 0)
+    total_steps = step_offset + args.recover_steps
     print("\n" + "=" * 78)
-    print(f"COMPRESSION + RECOVERY  (U,V of the core only; {args.recover_steps} steps, "
+    print(f"COMPRESSION + RECOVERY  (U,V of the core only; {args.recover_steps} steps "
+          f"[global {step_offset+1}..{total_steps}], "
           f"lr {args.recover_lr}, grad through last {args.grad_steps} of "
           f"{args.train_num_steps} recurrences)")
+    if args.resume_factors:
+        print(f"  resuming from: {args.resume_factors}")
     print("=" * 78)
     out = []
     s_eval = args.recover_eval_steps
     for r in args.ranks:
         comp.apply(r)
+
+        # --- Resume from checkpoint if provided ---
+        if args.resume_factors:
+            ckpt = torch.load(args.resume_factors, map_location=args.device,
+                              weights_only=False)
+            # Support both old format (bare factor dicts) and new format
+            if isinstance(ckpt, dict) and "factors" in ckpt:
+                factor_states = ckpt["factors"]
+            else:
+                factor_states = ckpt
+            for (i, t) in comp.orig:
+                lr_mod = _proj(comp.blocks[i], t)
+                lr_mod.load_state_dict(
+                    {k: v.to(lr_mod.U.weight.device) for k, v in factor_states[(i, t)].items()}
+                )
+            print(f"    Loaded factor weights from checkpoint")
+
         before = eval_loss(model, val_data, s_eval, args.batch_size, args.device)
 
         for p in model.parameters():
@@ -335,12 +357,20 @@ def stage_recover(model, comp, train_data, val_data, args):
                 params.append(p)
         opt = torch.optim.AdamW(params, lr=args.recover_lr, betas=(0.9, 0.95),
                                 weight_decay=0.0)
+
+        # Restore optimizer state if available in checkpoint
+        if args.resume_factors and isinstance(ckpt, dict) and "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+            print(f"    Restored optimizer state from checkpoint")
+        elif args.resume_factors:
+            print(f"    NOTE: checkpoint has no optimizer state; Adam restarts fresh")
+
         model.train()
         model.gradient_checkpointing = True
         no_grad = args.train_num_steps - args.grad_steps
         warmup = max(1, args.recover_steps // 10)
         t0 = time.perf_counter()
-        it = 0
+        it = getattr(args, 'start_it', 0)
         best_val = before
         best_path = None
 
@@ -350,11 +380,19 @@ def stage_recover(model, comp, train_data, val_data, args):
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             best_path = ckpt_dir / f"factors_r{r}_step{step_num}.pt"
             torch.save(
-                {k: _proj(comp.blocks[k[0]], k[1]).state_dict() for k in comp.orig},
+                {
+                    "factors": {k: _proj(comp.blocks[k[0]], k[1]).state_dict()
+                                for k in comp.orig},
+                    "optimizer": opt.state_dict(),
+                    "step": step_num,
+                    "it": it,
+                    "val_loss": val_loss,
+                },
                 best_path,
             )
 
         for step in range(args.recover_steps):
+            global_step = step_offset + step
             lr = args.recover_lr * min(1.0, (step + 1) / warmup)
             for g in opt.param_groups:
                 g["lr"] = lr
@@ -382,8 +420,8 @@ def stage_recover(model, comp, train_data, val_data, args):
                 params, 1.0, error_if_nonfinite=True
             )
             opt.step()
-            completed = step + 1
-            if completed % 25 == 0 or completed == args.recover_steps:
+            global_completed = global_step + 1
+            if (step + 1) % 25 == 0 or (step + 1) == args.recover_steps:
                 cuda_device = torch.device(args.device)
                 cuda_index = (
                     cuda_device.index
@@ -407,9 +445,9 @@ def stage_recover(model, comp, train_data, val_data, args):
                     model.gradient_checkpointing = True
                 if val < best_val:
                     best_val = val
-                    save_factors(completed, val)
+                    save_factors(global_completed, val)
                 print(
-                    f"    [r={r}] update {completed}/{args.recover_steps} "
+                    f"    [r={r}] update {global_completed}/{total_steps} "
                     f"train_avg={train_loss_sum / args.accum:.4f} "
                     f"val={val:.4f} best={best_val:.4f} "
                     f"grad_norm={float(grad_norm):.4f} "
@@ -491,6 +529,13 @@ def main():
     p.add_argument("--train-num-steps", type=int, default=32)
     p.add_argument("--grad-steps", type=int, default=8)
     p.add_argument("--recover-eval-steps", type=int, default=32)
+    # resume / continuation
+    p.add_argument("--resume-factors", default=None,
+                   help="Path to saved factor checkpoint to resume from")
+    p.add_argument("--start-it", type=int, default=0,
+                   help="Starting data iterator position for continuation")
+    p.add_argument("--start-step", type=int, default=0,
+                   help="Global step offset for continuation runs")
     args = p.parse_args()
 
     args.device = "cuda"
