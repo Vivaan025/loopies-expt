@@ -312,6 +312,66 @@ def stage_error(model, comp, data, args):
     return out
 
 
+@torch.no_grad()
+def stage_eval_loops(model, comp, data, args):
+    """Evaluate full, compressed, and recovered models at multiple loop counts."""
+    steps = args.steps
+    print("\n" + "=" * 78)
+    print(f"LOOP-COUNT EVALUATION  (rank {args.ranks}, steps={steps}, "
+          f"{len(data)}x{data.shape[1] - 1} tokens)")
+    if args.resume_factors:
+        print(f"  recovered checkpoint: {args.resume_factors}")
+    print("=" * 78)
+
+    header = f"  {'model':<20} | " + " ".join(f"{'s=' + str(s):>8}" for s in steps)
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    rows = []
+
+    # 1. Full model (original)
+    comp.restore()
+    full = {s: eval_loss(model, data, s, args.batch_size, args.device) for s in steps}
+    rows.append(dict(model="full", loss=full))
+    print(f"  {'full (original)':<20} | " +
+          " ".join(f"{full[s]:>8.4f}" for s in steps), flush=True)
+
+    for r in args.ranks:
+        # 2. Compressed, untrained (raw SVD)
+        comp.apply(r)
+        compressed = {s: eval_loss(model, data, s, args.batch_size, args.device) for s in steps}
+        rows.append(dict(model=f"svd_r{r}", loss=compressed))
+        print(f"  {f'svd r={r}':<20} | " +
+              " ".join(f"{compressed[s]:>8.4f}" for s in steps), flush=True)
+
+        # 3. Recovered (from checkpoint)
+        if args.resume_factors:
+            ckpt = torch.load(args.resume_factors, map_location=args.device,
+                              weights_only=False)
+            if isinstance(ckpt, dict) and "factors" in ckpt:
+                factor_states = ckpt["factors"]
+            else:
+                factor_states = ckpt
+            for (i, t) in comp.orig:
+                lr_mod = _proj(comp.blocks[i], t)
+                lr_mod.load_state_dict(
+                    {k: v.to(lr_mod.U.weight.device) for k, v in factor_states[(i, t)].items()}
+                )
+            recovered = {s: eval_loss(model, data, s, args.batch_size, args.device) for s in steps}
+            rows.append(dict(model=f"recovered_r{r}", loss=recovered))
+            print(f"  {f'recovered r={r}':<20} | " +
+                  " ".join(f"{recovered[s]:>8.4f}" for s in steps), flush=True)
+
+            # Print recovery % at each step count
+            print(f"  {'recovery %':<20} | " +
+                  " ".join(f"{100 * (compressed[s] - recovered[s]) / (compressed[s] - full[s]):>7.1f}%"
+                           if compressed[s] != full[s] else f"{'n/a':>8}"
+                           for s in steps), flush=True)
+
+        comp.restore()
+    return rows
+
+
 def stage_recover(model, comp, train_data, val_data, args):
     step_offset = getattr(args, 'start_step', 0)
     total_steps = step_offset + args.recover_steps
@@ -509,7 +569,8 @@ def stage_latency(model, comp, args, B=1, S=1024, iters=10, warmup=3):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--stage", default="all",
-                   choices=["all", "spectrum", "compress", "error", "recover", "latency"])
+                   choices=["all", "spectrum", "compress", "error", "recover",
+                            "eval-loops", "latency"])
     p.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     p.add_argument("--out-dir", default="results/huginn")
     p.add_argument("--ranks", type=int, nargs="+", default=[256, 512, 1024, 2048])
@@ -573,6 +634,8 @@ def main():
         train = build_token_set(tok, args.data_dir, "train", args.train_seqs,
                                 args.seq_len, args.out_dir)
         results["recover"] = stage_recover(model, comp, train, val, args)
+    if args.stage == "eval-loops":
+        results["eval_loops"] = stage_eval_loops(model, comp, val, args)
 
     path = os.path.join(args.out_dir, f"results_{args.stage}.json")
     with open(path, "w") as f:
