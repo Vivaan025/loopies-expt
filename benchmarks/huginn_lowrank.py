@@ -320,53 +320,88 @@ def stage_eval_loops(model, comp, data, args):
     print(f"LOOP-COUNT EVALUATION  (rank {args.ranks}, steps={steps}, "
           f"{len(data)}x{data.shape[1] - 1} tokens)")
     if args.resume_factors:
-        print(f"  recovered checkpoint: {args.resume_factors}")
+        print(f"  recovered checkpoint(s): {args.resume_factors}")
     print("=" * 78)
 
-    header = f"  {'model':<20} | " + " ".join(f"{'s=' + str(s):>8}" for s in steps)
+    header = f"  {'model':<22} | " + " ".join(f"{'s=' + str(s):>8}" for s in steps)
     print(header)
     print("  " + "-" * (len(header) - 2))
 
     rows = []
 
+    # Check if reusing baselines from an earlier run
+    cached_full = None
+    cached_svd = {}
+    if getattr(args, 'reuse_baselines', None) and os.path.exists(args.reuse_baselines):
+        with open(args.reuse_baselines) as f:
+            base_json = json.load(f)
+        for row in base_json.get("eval_loops", []):
+            m = row["model"]
+            if m == "full":
+                cached_full = {int(k): v for k, v in row["loss"].items()}
+            elif m.startswith("svd_r"):
+                r_val = int(m.split("_r")[1])
+                cached_svd[r_val] = {int(k): v for k, v in row["loss"].items()}
+
     # 1. Full model (original)
-    comp.restore()
-    full = {s: eval_loss(model, data, s, args.batch_size, args.device) for s in steps}
-    rows.append(dict(model="full", loss=full))
-    print(f"  {'full (original)':<20} | " +
-          " ".join(f"{full[s]:>8.4f}" for s in steps), flush=True)
+    if cached_full is not None:
+        full = cached_full
+        rows.append(dict(model="full", loss=full))
+        print(f"  {'full (original)':<22} | " +
+              " ".join(f"{full[s]:>8.4f}" for s in steps), flush=True)
+    else:
+        comp.restore()
+        full = {s: eval_loss(model, data, s, args.batch_size, args.device) for s in steps}
+        rows.append(dict(model="full", loss=full))
+        print(f"  {'full (original)':<22} | " +
+              " ".join(f"{full[s]:>8.4f}" for s in steps), flush=True)
 
     for r in args.ranks:
         # 2. Compressed, untrained (raw SVD)
-        comp.apply(r)
-        compressed = {s: eval_loss(model, data, s, args.batch_size, args.device) for s in steps}
-        rows.append(dict(model=f"svd_r{r}", loss=compressed))
-        print(f"  {f'svd r={r}':<20} | " +
-              " ".join(f"{compressed[s]:>8.4f}" for s in steps), flush=True)
+        if r in cached_svd:
+            compressed = cached_svd[r]
+            rows.append(dict(model=f"svd_r{r}", loss=compressed))
+            print(f"  {f'svd r={r}':<22} | " +
+                  " ".join(f"{compressed[s]:>8.4f}" for s in steps), flush=True)
+            comp.apply(r)
+        else:
+            comp.apply(r)
+            compressed = {s: eval_loss(model, data, s, args.batch_size, args.device) for s in steps}
+            rows.append(dict(model=f"svd_r{r}", loss=compressed))
+            print(f"  {f'svd r={r}':<22} | " +
+                  " ".join(f"{compressed[s]:>8.4f}" for s in steps), flush=True)
 
-        # 3. Recovered (from checkpoint)
+        # 3. Recovered (from checkpoint(s))
         if args.resume_factors:
-            ckpt = torch.load(args.resume_factors, map_location=args.device,
-                              weights_only=False)
-            if isinstance(ckpt, dict) and "factors" in ckpt:
-                factor_states = ckpt["factors"]
-            else:
-                factor_states = ckpt
-            for (i, t) in comp.orig:
-                lr_mod = _proj(comp.blocks[i], t)
-                lr_mod.load_state_dict(
-                    {k: v.to(lr_mod.U.weight.device) for k, v in factor_states[(i, t)].items()}
-                )
-            recovered = {s: eval_loss(model, data, s, args.batch_size, args.device) for s in steps}
-            rows.append(dict(model=f"recovered_r{r}", loss=recovered))
-            print(f"  {f'recovered r={r}':<20} | " +
-                  " ".join(f"{recovered[s]:>8.4f}" for s in steps), flush=True)
+            ckpts = args.resume_factors if isinstance(args.resume_factors, list) else [args.resume_factors]
+            for ckpt_path in ckpts:
+                ckpt = torch.load(ckpt_path, map_location=args.device,
+                                  weights_only=False)
+                if isinstance(ckpt, dict) and "factors" in ckpt:
+                    factor_states = ckpt["factors"]
+                else:
+                    factor_states = ckpt
+                for (i, t) in comp.orig:
+                    lr_mod = _proj(comp.blocks[i], t)
+                    lr_mod.load_state_dict(
+                        {k: v.to(lr_mod.U.weight.device) for k, v in factor_states[(i, t)].items()}
+                    )
+                recovered = {s: eval_loss(model, data, s, args.batch_size, args.device) for s in steps}
+                ckpt_stem = Path(ckpt_path).stem
+                label = f"rec {ckpt_stem}"
+                rows.append(dict(model=f"recovered_r{r}_{ckpt_stem}", loss=recovered, checkpoint=ckpt_path))
+                print(f"  {label:<22} | " +
+                      " ".join(f"{recovered[s]:>8.4f}" for s in steps), flush=True)
 
-            # Print recovery % at each step count
-            print(f"  {'recovery %':<20} | " +
-                  " ".join(f"{100 * (compressed[s] - recovered[s]) / (compressed[s] - full[s]):>7.1f}%"
-                           if compressed[s] != full[s] else f"{'n/a':>8}"
-                           for s in steps), flush=True)
+                # Print recovery % at each step count
+                rec_pcts = {
+                    s: (100 * (compressed[s] - recovered[s]) / (compressed[s] - full[s]))
+                    if compressed[s] != full[s] else 0.0
+                    for s in steps
+                }
+                rows.append(dict(model=f"recovery_pct_r{r}_{ckpt_stem}", pct=rec_pcts))
+                print(f"  {'  recovery %':<22} | " +
+                      " ".join(f"{rec_pcts[s]:>7.1f}%" for s in steps), flush=True)
 
         comp.restore()
     return rows
@@ -380,8 +415,11 @@ def stage_recover(model, comp, train_data, val_data, args):
           f"[global {step_offset+1}..{total_steps}], "
           f"lr {args.recover_lr}, grad through last {args.grad_steps} of "
           f"{args.train_num_steps} recurrences)")
-    if args.resume_factors:
-        print(f"  resuming from: {args.resume_factors}")
+    resume_path = args.resume_factors
+    if isinstance(resume_path, list):
+        resume_path = resume_path[0] if len(resume_path) > 0 else None
+    if resume_path:
+        print(f"  resuming from: {resume_path}")
     print("=" * 78)
     out = []
     s_eval = args.recover_eval_steps
@@ -389,8 +427,8 @@ def stage_recover(model, comp, train_data, val_data, args):
         comp.apply(r)
 
         # --- Resume from checkpoint if provided ---
-        if args.resume_factors:
-            ckpt = torch.load(args.resume_factors, map_location=args.device,
+        if resume_path:
+            ckpt = torch.load(resume_path, map_location=args.device,
                               weights_only=False)
             # Support both old format (bare factor dicts) and new format
             if isinstance(ckpt, dict) and "factors" in ckpt:
@@ -419,10 +457,10 @@ def stage_recover(model, comp, train_data, val_data, args):
                                 weight_decay=0.0)
 
         # Restore optimizer state if available in checkpoint
-        if args.resume_factors and isinstance(ckpt, dict) and "optimizer" in ckpt:
+        if resume_path and isinstance(ckpt, dict) and "optimizer" in ckpt:
             opt.load_state_dict(ckpt["optimizer"])
             print(f"    Restored optimizer state from checkpoint")
-        elif args.resume_factors:
+        elif resume_path:
             print(f"    NOTE: checkpoint has no optimizer state; Adam restarts fresh")
 
         model.train()
@@ -609,9 +647,11 @@ def main():
     p.add_argument("--train-num-steps", type=int, default=32)
     p.add_argument("--grad-steps", type=int, default=8)
     p.add_argument("--recover-eval-steps", type=int, default=32)
-    # resume / continuation
-    p.add_argument("--resume-factors", default=None,
-                   help="Path to saved factor checkpoint to resume from")
+    # resume / continuation / eval
+    p.add_argument("--resume-factors", nargs="*", default=None,
+                   help="Path(s) to saved factor checkpoint(s) to resume from or evaluate")
+    p.add_argument("--reuse-baselines", default=None,
+                   help="Path to previous results_eval-loops.json to reuse full and svd losses")
     p.add_argument("--start-it", type=int, default=0,
                    help="Starting data iterator position for continuation")
     p.add_argument("--start-step", type=int, default=0,
