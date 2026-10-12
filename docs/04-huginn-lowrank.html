@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Huginn Low-Rank Core</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1f2328; --muted: #59636e; --rule: #d8dee4; --panel: #f6f8fa;
+    --grey: #b8bcc2; --accent: 47,111,219; --accent-c: rgb(47,111,219); --accent-tint: rgba(47,111,219,.12);
+    --green: #1a7f37; --green-tint: rgba(26,127,55,.12);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1115; --fg: #e6e8eb; --muted: #9aa3ad; --rule: #2d333b; --panel: #161a20;
+            --grey: #5b626b; --accent: 110,160,255; --accent-c: rgb(110,160,255); --accent-tint: rgba(110,160,255,.15);
+            --green: #3fb950; --green-tint: rgba(63,185,80,.15); }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 30px; line-height: 1.25; margin: 0 0 4px; }
+  h2 { font-size: 22px; margin: 44px 0 10px; padding-top: 12px; border-top: 1px solid var(--rule); }
+  h3 { font-size: 17px; margin: 28px 0 8px; }
+  .byline { color: var(--muted); font-size: 14px; margin-bottom: 24px; }
+  .tldr { background: var(--accent-tint); border-left: 4px solid var(--accent-c);
+          padding: 14px 18px; border-radius: 6px; }
+  .tldr p:first-child { margin-top: 0; font-weight: 600; }
+  .tldr ul { margin-bottom: 0; }
+  .note-box { background: var(--panel); border-left: 4px solid var(--grey);
+              padding: 12px 16px; border-radius: 6px; margin: 16px 0; font-size: 14.5px; }
+  code { font: 13.5px ui-monospace, SFMono-Regular, Consolas, monospace;
+         background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--panel); padding: 12px 14px; border-radius: 6px; overflow-x: auto; }
+  pre code { background: none; padding: 0; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; margin: 8px 0; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+  td.wrap { white-space: normal; }
+  th { color: var(--muted); font-weight: 600; }
+  tr.hi td { font-weight: 600; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  figure { margin: 18px 0; }
+  figcaption { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  svg { width: 100%; height: auto; display: block; }
+  svg text { fill: var(--fg); font-family: inherit; }
+  svg .q { fill: var(--muted); }
+  ul.tasks { list-style: none; padding-left: 4px; }
+  ul.tasks li::before { content: "☐ "; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Low-Rank Shared Core in Huginn-0125</h1>
+<div class="byline">Phase 9 · branch <code>lowrank-shared</code> · pretrained 3.5B loop LM · RTX 5090 · 2026-10-12 · follows <a href="03-lowrank-shared.html">Phase 8 (toy model)</a></div>
+
+<div class="tldr">
+  <p>We applied the W ≈ UV low-rank parameterization to the recurrent core of the pretrained 3.5B Huginn-0125 (1.58B core weights). Raw SVD compression alone incurs a substantial penalty (loss rises from 2.454 to 3.063 at rank 2048, 2× core compression). However, fine-tuning only the low-rank U and V factors recovers nearly half of the lost quality, with speedups and recovery transferring across recurrence depths.</p>
+  <ul>
+    <li><b>Huginn's core weights are not naturally low-rank:</b> At rank 2048 (2× core compression), MLP projections retain only 72–73% of singular energy; attention projections retain 85–90%.</li>
+    <li><b>Error settles into a stable state:</b> Relative hidden-state error rises over 8 loops (0.47 → 0.79 at r=2048) and flattens at 0.80 through loop 64.</li>
+    <li><b>Recovery fine-tuning succeeds:</b> A 1,000-update continuation run closed <b>47.4%</b> of the compression penalty at 32 loops on the 256-sequence validation set (2.8272 vs 3.1128 raw SVD; full is 2.5107).</li>
+    <li><b>Recovery generalizes across loop counts:</b> Although trained strictly at 32 recurrences, recovery benefits transfer evenly across 4, 8, 16, 32, and 64 loops (46.8%–50.7% penalty recovered).</li>
+    <li><b>Verified forward speedup:</b> Measured full-model latency is <b>1.57× faster at 16 loops</b> (201.0 ms vs 315.6 ms) and <b>1.60× faster at 32 loops</b> (381.0 ms vs 610.8 ms).</li>
+    <li><b>Plateau around 16 loops:</b> Both full and recovered models achieve almost all recurrence gains by 16 loops (gaining &lt;0.003 loss from 16 to 32 loops), highlighting 16 loops as an effective inference operating point.</li>
+  </ul>
+</div>
+
+<h2>1. Model Layout & Compression Scheme</h2>
+<p>Each core projection is factored into truncated-SVD factors U·V with no full-rank matrix preserved underneath. The identical factors are reused across all recurrent loops:</p>
+<figure>
+<svg viewBox="0 0 760 210" role="img" aria-label="Only Huginn's 4-block recurrent core is compressed" font-size="13">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--grey)"/></marker>
+    <marker id="arA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--accent-c)"/></marker>
+  </defs>
+  <text x="20" y="28" font-size="15" font-weight="600">Only Huginn's 4-block recurrent core is compressed</text>
+  <g fill="none" stroke="var(--grey)" stroke-width="1.25">
+    <path d="M148 130H168" marker-end="url(#ar)"/><path d="M296 130H316" marker-end="url(#ar)"/>
+    <path d="M444 130H464" marker-end="url(#ar)"/><path d="M592 130H612" marker-end="url(#ar)"/>
+    <rect x="20" y="100" width="128" height="60" rx="8"/><rect x="168" y="100" width="128" height="60" rx="8"/>
+    <rect x="464" y="100" width="128" height="60" rx="8"/><rect x="612" y="100" width="128" height="60" rx="8"/>
+  </g>
+  <path d="M420 100V82H340V100" fill="none" stroke="var(--accent-c)" stroke-width="1.5" marker-end="url(#arA)"/>
+  <text x="380" y="72" text-anchor="middle" font-size="11.5">loop num_steps times (4 – 64)</text>
+  <rect x="316" y="100" width="128" height="60" rx="8" fill="var(--accent-tint)" stroke="var(--accent-c)" stroke-width="2"/>
+  <g text-anchor="middle">
+    <text x="84" y="126" font-weight="600">Embedding</text><text x="84" y="144" font-size="11.5" class="q">65k vocab</text>
+    <text x="232" y="126" font-weight="600">Prelude</text><text x="232" y="144" font-size="11.5" class="q">2 blocks</text>
+    <text x="380" y="126" font-weight="600">Core</text><text x="380" y="144" font-size="11.5">adapter + 4 blocks</text>
+    <text x="528" y="126" font-weight="600">Coda</text><text x="528" y="144" font-size="11.5" class="q">2 blocks</text>
+    <text x="676" y="126" font-weight="600">LM head</text><text x="676" y="144" font-size="11.5" class="q">tied to embedding</text>
+    <text x="380" y="184" font-size="11.5" class="q">W = UV in Wqkv, attn proj, mlp fc, mlp proj</text>
+    <text x="380" y="200" font-size="11.5" class="q">16 matrices, 1.58B of 3.56B params</text>
+  </g>
+</svg>
+<figcaption>Huginn-0125 (RavenForCausalLM) · width 5280 · 55 heads · gated MLP 17920 · default 32 loops</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+  <tr><th></th><th>Phase 8 (toy)</th><th>Phase 9 (Huginn)</th></tr>
+  <tr><td>Model</td><td>LoopLM, trained from scratch</td><td>Huginn-0125, pretrained (≈ 800B tokens)</td></tr>
+  <tr><td>Total / core params</td><td>35.5M / 3.15M</td><td>3.56B / 1.58B</td></tr>
+  <tr><td>Core architecture</td><td>1 block, d = 512</td><td>adapter + 4 blocks, d = 5280</td></tr>
+  <tr><td>Loops</td><td>fixed at 4</td><td>recurrent; tested 4, 8, 16, 32, 64</td></tr>
+  <tr><td>Full-rank val loss</td><td>4.787</td><td>2.454 (32-seq sample) / 2.511 (256-seq sample)</td></tr>
+  <tr><td>Ranks tested</td><td>16 – 256</td><td>512 – 3072</td></tr>
+</table></div>
+
+<h2>2. Post-Training SVD Compression (No Fine-Tuning)</h2>
+
+<figure><svg id="chart-loss" viewBox="0 0 760 380" role="img" aria-label="Compressed cores stop benefiting from extra loops" font-size="12"></svg>
+<figcaption>Source: <code>results/huginn/results_all.json</code> · 32 × 1024 FineWeb val tokens · SVD compression, no fine-tuning · hover a point for its value</figcaption></figure>
+
+<p>The full model improves 0.49 in loss going from 4 to 32 loops. Uncompressed core weights refine representations at each pass, but raw truncated SVD reduces that refinement capacity. Beyond 32 loops, performance plateaus for all variants.</p>
+
+<figure><svg id="chart-error" viewBox="0 0 760 360" role="img" aria-label="Error grows for about 8 loops, then plateaus" font-size="12"></svg>
+<figcaption>Source: <code>results/huginn/results_all.json</code> · 8 × 1024 tokens · relative error of the last core block's output after each loop</figcaption></figure>
+
+<p>The relative hidden-state error rises rapidly over the first 4–8 loops and then stabilizes. Huginn's recurrent core is trained to settle into a stable attractor state; the compressed core also settles into an attractor, bounded rather than divergent.</p>
+
+<h3>Cost and Quality by Rank (Zero-Shot SVD)</h3>
+<div class="table-wrap"><table>
+  <tr><th>Rank</th><th class="num">Core params</th><th class="num">Compression</th><th class="num">Val loss (32 loops, 32 seqs)</th><th class="num">Δ vs full</th><th class="num">Forward latency, 32 loops (ms)</th><th class="num">Speedup</th></tr>
+  <tr><td>full</td><td class="num">1.58B</td><td class="num">1.0×</td><td class="num">2.454</td><td class="num">—</td><td class="num">618</td><td class="num">1.00×</td></tr>
+  <tr class="hi"><td>3072</td><td class="num">1.18B</td><td class="num">1.3×</td><td class="num">2.635</td><td class="num">+0.18</td><td class="num">505</td><td class="num">1.22×</td></tr>
+  <tr><td>2048</td><td class="num">0.79B</td><td class="num">2.0×</td><td class="num">3.063</td><td class="num">+0.61</td><td class="num">381</td><td class="num">1.62×</td></tr>
+  <tr><td>1024</td><td class="num">0.39B</td><td class="num">4.0×</td><td class="num">4.107</td><td class="num">+1.65</td><td class="num">255</td><td class="num">2.42×</td></tr>
+  <tr><td>512</td><td class="num">0.20B</td><td class="num">8.0×</td><td class="num">4.831</td><td class="num">+2.38</td><td class="num">194</td><td class="num">3.19×</td></tr>
+</table></div>
+
+<h3>Spectrum: Core Projection Energy Distribution</h3>
+<p>Share of squared singular value energy kept at rank r, averaged across the 4 core blocks:</p>
+<div class="table-wrap"><table>
+  <tr><th>Projection</th><th>Shape</th><th class="num">r512</th><th class="num">r1024</th><th class="num">r2048</th><th class="num">r3072</th></tr>
+  <tr><td>Wqkv</td><td>15840 × 5280</td><td class="num">0.53</td><td class="num">0.68</td><td class="num">0.85</td><td class="num">0.94</td></tr>
+  <tr><td>attn proj</td><td>5280 × 5280</td><td class="num">0.48</td><td class="num">0.69</td><td class="num">0.90</td><td class="num">0.97</td></tr>
+  <tr><td>mlp fc</td><td>35840 × 5280</td><td class="num">0.38</td><td class="num">0.53</td><td class="num">0.73</td><td class="num">0.86</td></tr>
+  <tr><td>mlp proj</td><td>5280 × 17920</td><td class="num">0.34</td><td class="num">0.51</td><td class="num">0.72</td><td class="num">0.86</td></tr>
+</table></div>
+
+<h2>3. Recovery Fine-Tuning: Closing the Gap</h2>
+<p>To repair the compression error, we fine-tune <b>only the U and V factors of the core projections</b> (0.79B parameters at rank 2048), keeping all remaining model components (embeddings, prelude, loop adapter, coda, LM head) completely frozen. Training uses truncated backpropagation through the last 8 of 32 loops with AdamW (lr 1e-5, linear warmup).</p>
+
+<div class="note-box">
+  <b>Verified Batch Configuration &amp; Token Accounting:</b><br>
+  • <b>Microbatch:</b> 1 sequence (1,024 target tokens).<br>
+  • <b>Gradient Accumulation:</b> 8 steps → <b>Effective batch:</b> 8 sequences = <b>8,192 tokens per optimizer update</b>.<br>
+  • <b>Pilot run (Updates 1–225):</b> 225 updates × 8,192 tokens = <b>1.84M token presentations</b>.<br>
+  • <b>1,000-Update Continuation (Updates 226–1225):</b> 1,000 updates × 8,192 tokens = <b>8.192M additional token presentations</b> (drawn from an allocated buffer of 20,000 sequences, indices 0..7,999).<br>
+  • <b>Data Reuse:</b> Because the continuation run initialized its data iterator at index 0 of shard 0, sequences 0..1,799 were repeated presentations from the pilot; sequences 1,800..7,999 (6.35M tokens) were fresh presentations.<br>
+  • <b>Cumulative Token Presentations:</b> 1.84M + 8.19M = <b>10.03M token presentations</b>.
+</div>
+
+<h3>32-Sequence Validation Monitoring Sample (32 Loops)</h3>
+<p>Calculated strictly within the 32-sequence validation sample used during training monitoring:</p>
+<div class="table-wrap"><table>
+  <tr><th>Checkpoint</th><th class="num">Optimizer updates</th><th class="num">Cumulative tokens presented</th><th class="num">Val loss (32 loops)</th><th class="num">Δ vs full (2.4541)</th><th class="num">Compression penalty recovered</th></tr>
+  <tr><td>Full model (original)</td><td class="num">—</td><td class="num">—</td><td class="num">2.4541</td><td class="num">—</td><td class="num">—</td></tr>
+  <tr><td>Raw SVD (r=2048)</td><td class="num">0</td><td class="num">0</td><td class="num">3.0633</td><td class="num">+0.6092</td><td class="num">0.0%</td></tr>
+  <tr><td>Update 225 (pilot)</td><td class="num">225</td><td class="num">1.84M</td><td class="num">2.8044</td><td class="num">+0.3503</td><td class="num">42.5%</td></tr>
+  <tr class="hi"><td>Update 1225 (continuation)</td><td class="num">1,225</td><td class="num">10.03M</td><td class="num">2.7682</td><td class="num">+0.3141</td><td class="num">48.4%</td></tr>
+</table></div>
+
+<h3>Held-Out 256-Sequence Validation Set Comparison (262k Tokens)</h3>
+<p>To assess generalization, we evaluated the full model, raw SVD, update 225, and update 1225 side-by-side across recurrence loop depths on the separate 256-sequence validation set (controlled RNG seed, <code>results/huginn/eval_loops/results_eval-loops.json</code>):</p>
+
+<div class="table-wrap"><table>
+  <tr>
+    <th>Model Variant</th>
+    <th class="num">s = 4</th>
+    <th class="num">s = 8</th>
+    <th class="num">s = 16</th>
+    <th class="num">s = 32</th>
+    <th class="num">s = 64</th>
+  </tr>
+  <tr>
+    <td><b>Full Huginn (original)</b></td>
+    <td class="num">2.9931</td>
+    <td class="num">2.6027</td>
+    <td class="num">2.5140</td>
+    <td class="num">2.5107</td>
+    <td class="num">2.5109</td>
+  </tr>
+  <tr>
+    <td><b>Raw SVD (r=2048)</b></td>
+    <td class="num">3.4288</td>
+    <td class="num">3.1606</td>
+    <td class="num">3.1118</td>
+    <td class="num">3.1128</td>
+    <td class="num">3.1141</td>
+  </tr>
+  <tr>
+    <td><b>Recovered (Update 225)</b></td>
+    <td class="num">3.2583</td>
+    <td class="num">2.9399</td>
+    <td class="num">2.8694</td>
+    <td class="num">2.8669</td>
+    <td class="num">2.8672</td>
+  </tr>
+  <tr>
+    <td style="color:var(--muted); padding-left:24px;">↳ Recovery % (Update 225)</td>
+    <td class="num" style="color:var(--muted);">39.1%</td>
+    <td class="num" style="color:var(--muted);">39.5%</td>
+    <td class="num" style="color:var(--muted);">40.5%</td>
+    <td class="num" style="color:var(--muted);">40.8%</td>
+    <td class="num" style="color:var(--muted);">40.9%</td>
+  </tr>
+  <tr class="hi">
+    <td><b>Recovered (Update 1225 continuation)</b></td>
+    <td class="num">3.2081</td>
+    <td class="num">2.8993</td>
+    <td class="num">2.8301</td>
+    <td class="num">2.8272</td>
+    <td class="num">2.8276</td>
+  </tr>
+  <tr class="hi" style="color:var(--green);">
+    <td style="padding-left:24px;">↳ Recovery % (Update 1225)</td>
+    <td class="num">50.7%</td>
+    <td class="num">46.8%</td>
+    <td class="num">47.1%</td>
+    <td class="num">47.4%</td>
+    <td class="num">47.5%</td>
+  </tr>
+</table></div>
+
+<figure><svg id="chart-eval-loops" viewBox="0 0 760 380" role="img" aria-label="Recovery transfers across all loop depths" font-size="12"></svg>
+<figcaption>Source: <code>results/huginn/eval_loops/results_eval-loops.json</code> · 256 × 1024 FineWeb validation tokens · deterministic evaluation</figcaption></figure>
+
+<h2>4. Forward Latency & Quality–Speed Tradeoff</h2>
+<p>Forward execution latency measured on an RTX 5090 (B=1, S=1024, eager <code>bfloat16</code>, CUDA events, 10 iterations):</p>
+
+<div class="note-box">
+  <b>Timed Architecture:</b> Benchmarked using the rank-2048 low-rank core architecture. Because low-rank factorized projections have identical matrix dimensions across raw SVD and recovered checkpoints, the forward latency applies equally to both.
+</div>
+
+<div class="table-wrap"><table>
+  <tr><th>Configuration</th><th class="num">Total params</th><th class="num">Core params</th><th class="num">Latency (16 loops)</th><th class="num">Latency (32 loops)</th><th class="num">Forward speedup</th></tr>
+  <tr><td>Full Huginn-0125</td><td class="num">3.56B</td><td class="num">1.58B</td><td class="num">315.6 ms</td><td class="num">610.8 ms</td><td class="num">1.00× (baseline)</td></tr>
+  <tr class="hi"><td>Rank 2048 Core</td><td class="num">2.77B (-22.3%)</td><td class="num">0.79B (-50.0%)</td><td class="num">201.0 ms</td><td class="num">381.0 ms</td><td class="num"><b>1.57× (16s) / 1.60× (32s)</b></td></tr>
+</table></div>
+
+<h2>5. Key Findings</h2>
+<ul>
+  <li><b>Recovery transfers across recurrence counts:</b> Although recovery fine-tuning was trained strictly on 32 loops, recovery gains transfer across 4, 8, 16, 32, and 64 loops (~47–51% penalty recovered). The factors learned to improve recurrent state representation generally, not overfit a specific step count.</li>
+  <li><b>The 1,000-update continuation broke through the initial plateau:</b> Extending training by 1,000 updates pushed validation loss down from 2.8669 to 2.8272 on the 256-sequence set, closing an additional 6.6% of the compression penalty.</li>
+  <li><b>16 loops represents an efficient operating point:</b> Both the full model and recovered models plateau near 16 loops (Full gains only 0.0033 from 16 to 32 loops; Recovered-1225 gains only 0.0029). At 16 loops, the compressed core delivers <b>201.0 ms latency (1.57× speedup)</b> at a validation loss of <b>2.8301</b>.</li>
+  <li><b>Remaining quality gap:</b> Even with 47.4% of the compression penalty recovered, a gap of ~0.316 loss remains vs the full model (2.8272 vs 2.5107 at 32 loops). Uncompressed weights possess representational capacity that rank-2048 alone cannot fully match without architectural changes (such as non-uniform rank allocation).</li>
+</ul>
+
+<h2>6. Caveats</h2>
+<ul>
+  <li><b>Experimentation set used for validation:</b> All recovery metrics reported here use the 32-sequence and 256-sequence validation samples. A separate, untouched held-out sample must be reserved for final evaluation.</li>
+  <li><b>Uniform projection rank:</b> Every projection in the core currently uses an identical rank $r=2048$. Spectrum analysis indicates that MLP projections lose significantly more singular energy than attention projections, suggesting that non-uniform rank allocation could yield higher quality at the same parameter budget.</li>
+  <li><b>Frozen adapter:</b> The recurrent state adapter remains full rank (10,560 × 5,280).</li>
+  <li><b>Eager PyTorch execution:</b> Latencies measure eager execution without <code>torch.compile</code>, CUDA graphs, or custom fused U·V kernels.</li>
+</ul>
+
+<h2>7. Next Steps</h2>
+<ul class="tasks">
+  <li>Evaluate non-uniform rank allocation: allocate higher rank to MLP projections (where energy loss is greatest) and lower rank to attention projections at an identical total parameter budget.</li>
+  <li>Benchmark downstream task performance (e.g., GSM8K reasoning benchmarks where recurrent refinement is most prominent).</li>
+  <li>Test higher ranks (such as $r=3072$) under recovery fine-tuning to evaluate quality retention vs latency.</li>
+  <li>Evaluate on an untouched held-out test split for final independent reporting.</li>
+</ul>
+
+</main>
+
+<script>
+const NS = "http://www.w3.org/2000/svg";
+function el(parent, tag, attrs, text) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) {
+    if ((k === "fill" || k === "stroke") && String(attrs[k]).includes("var(")) e.style[k] = attrs[k];
+    else e.setAttribute(k, attrs[k]);
+  }
+  if (text !== undefined) e.textContent = text;
+  parent.appendChild(e);
+  return e;
+}
+function path(parent, pts, attrs) {
+  return el(parent, "path", Object.assign({ d: pts.map((p, i) => (i ? "L" : "M") + p[0] + " " + p[1]).join(""), fill: "none" }, attrs));
+}
+const shade = { 3072: 1.0, 2048: 0.75, 1024: 0.5, 512: 0.3 };
+const col = r => r === "full" ? "var(--fg)" : `rgba(var(--accent), ${shade[r]})`;
+
+// ---- Chart 1: val loss vs num_steps per rank (zero-shot) ----
+(function () {
+  const steps = [4, 8, 16, 32, 64];
+  const loss = {
+    full: [2.9483, 2.5468, 2.4577, 2.4541, 2.4544],
+    3072: [3.1024, 2.7251, 2.6390, 2.6347, 2.6358],
+    2048: [3.3727, 3.1052, 3.0616, 3.0633, 3.0640],
+    1024: [4.1317, 4.0740, 4.1001, 4.1070, 4.1067],
+    512:  [4.9706, 4.8316, 4.8216, 4.8305, 4.8321],
+  };
+  const svg = document.getElementById("chart-loss");
+  const left = 64, pw = 560, y0 = 76, h = 250, ylo = 2.2, yhi = 5.2;
+  const X = i => left + i / 4 * pw, Y = v => y0 + (yhi - v) / (yhi - ylo) * h;
+  el(svg, "text", { x: 24, y: 28, "font-size": 15, "font-weight": 600 }, "Compressed cores stop benefiting from extra loops");
+  el(svg, "text", { x: 24, y: 50, "font-size": 11.5, class: "q" }, "Huginn-0125 validation loss vs. number of recurrent loops, by core rank (lower is better)");
+  for (let t = 2.5; t <= 5.0001; t += 0.5) {
+    el(svg, "line", { x1: left, x2: left + pw, y1: Y(t), y2: Y(t), stroke: "var(--rule)" });
+    el(svg, "text", { x: left - 8, y: Y(t) + 4, "text-anchor": "end", "font-size": 11.5, class: "q" }, t.toFixed(1));
+  }
+  steps.forEach((s, i) => el(svg, "text", { x: X(i), y: y0 + h + 22, "text-anchor": "middle", "font-size": 11.5, class: "q" }, s + " loops"));
+  el(svg, "line", { x1: X(3), x2: X(3), y1: y0, y2: y0 + h, stroke: "var(--grey)", "stroke-dasharray": "4 4" });
+  el(svg, "text", { x: X(3) + 6, y: y0 + 12, "font-size": 11, class: "q" }, "Huginn default (32)");
+  for (const r of ["512", "1024", "2048", "3072", "full"]) {
+    const vals = loss[r], key = r === "full" ? "full" : Number(r), c = col(key);
+    const pts = vals.map((v, i) => [X(i), Y(v)]);
+    path(svg, pts, { stroke: c, "stroke-width": r === "full" ? 2.5 : 2 });
+    pts.forEach((p, i) => {
+      const d = el(svg, "circle", { cx: p[0], cy: p[1], r: 3.5, fill: c });
+      el(d, "title", {}, `${r === "full" ? "full rank" : "rank " + r}, ${steps[i]} loops: ${vals[i].toFixed(3)}`);
+    });
+    el(svg, "text", { x: X(4) + 12, y: Y(vals[4]) + 4, "font-size": 11.5, "font-weight": r === "full" ? 600 : 400 },
+       (r === "full" ? "full rank" : "rank " + r) + "  " + vals[4].toFixed(2));
+  }
+})();
+
+// ---- Chart 2: per-step hidden-state error ----
+(function () {
+  const ts = [1, 2, 4, 8, 16, 32, 64];
+  const err = {
+    512:  [0.826, 1.025, 1.198, 1.233, 1.236, 1.237, 1.237],
+    1024: [0.681, 0.858, 1.038, 1.114, 1.127, 1.128, 1.129],
+    2048: [0.471, 0.597, 0.726, 0.788, 0.795, 0.795, 0.796],
+    3072: [0.318, 0.400, 0.476, 0.516, 0.515, 0.514, 0.515],
+  };
+  const svg = document.getElementById("chart-error");
+  const left = 64, pw = 560, y0 = 76, h = 230, ymax = 1.4;
+  const X = t => left + Math.log2(t) / 6 * pw, Y = v => y0 + h - v / ymax * h;
+  el(svg, "text", { x: 24, y: 28, "font-size": 15, "font-weight": 600 }, "Error grows for about 8 loops, then plateaus");
+  el(svg, "text", { x: 24, y: 50, "font-size": 11.5, class: "q" }, "Relative hidden-state error vs. the full model after each loop (log-scale x), no fine-tuning");
+  for (let t = 0; t <= 1.40001; t += 0.2) {
+    el(svg, "line", { x1: left, x2: left + pw, y1: Y(t), y2: Y(t), stroke: t === 0 ? "var(--grey)" : "var(--rule)" });
+    el(svg, "text", { x: left - 8, y: Y(t) + 4, "text-anchor": "end", "font-size": 11.5, class: "q" }, t.toFixed(1));
+  }
+  ts.forEach(t => el(svg, "text", { x: X(t), y: y0 + h + 22, "text-anchor": "middle", "font-size": 11.5, class: "q" }, "loop " + t));
+  el(svg, "rect", { x: X(8), y: y0, width: X(64) - X(8), height: h, fill: "var(--accent-tint)", opacity: 0.5 });
+  el(svg, "text", { x: (X(8) + X(64)) / 2, y: y0 + h - 10, "text-anchor": "middle", "font-size": 11, class: "q" }, "plateau: the loop has settled");
+  for (const r of [512, 1024, 2048, 3072]) {
+    const vals = err[r], c = col(r), pts = ts.map((t, i) => [X(t), Y(vals[i])]);
+    path(svg, pts, { stroke: c, "stroke-width": 2 });
+    pts.forEach((p, i) => {
+      const d = el(svg, "circle", { cx: p[0], cy: p[1], r: 3.5, fill: c });
+      el(d, "title", {}, `rank ${r}, loop ${ts[i]}: ${vals[i].toFixed(3)}`);
+    });
+    el(svg, "text", { x: X(64) + 12, y: Y(vals[6]) + 4, "font-size": 11.5 }, `rank ${r}  ${vals[6].toFixed(2)}`);
+  }
+})();
+
+// ---- Chart 3: Multi-Loop Evaluation on Held-Out 256-Sequence Sample ----
+(function () {
+  const steps = [4, 8, 16, 32, 64];
+  const data = {
+    full:       { label: "Full Huginn (original)", col: "var(--fg)", width: 2.5, vals: [2.9931, 2.6027, 2.5140, 2.5107, 2.5109] },
+    raw_svd:    { label: "Raw SVD (r=2048)",       col: "rgba(218,54,51,0.85)", width: 1.8, vals: [3.4288, 3.1606, 3.1118, 3.1128, 3.1141] },
+    upd_225:    { label: "Recovered (Upd 225)",    col: "rgba(47,111,219,0.7)",  width: 1.8, vals: [3.2583, 2.9399, 2.8694, 2.8669, 2.8672] },
+    upd_1225:   { label: "Recovered (Upd 1225)",   col: "var(--green)",          width: 2.5, vals: [3.2081, 2.8993, 2.8301, 2.8272, 2.8276] },
+  };
+  const svg = document.getElementById("chart-eval-loops");
+  const left = 64, pw = 560, y0 = 76, h = 250, ylo = 2.4, yhi = 3.6;
+  const X = i => left + i / 4 * pw, Y = v => y0 + (yhi - v) / (yhi - ylo) * h;
+  el(svg, "text", { x: 24, y: 28, "font-size": 15, "font-weight": 600 }, "Fine-Tuning Recovers Performance Across All Loop Depths");
+  el(svg, "text", { x: 24, y: 50, "font-size": 11.5, class: "q" }, "Validation loss vs loop depth on held-out 256-sequence sample (262k tokens, lower is better)");
+  for (let t = 2.4; t <= 3.6001; t += 0.2) {
+    el(svg, "line", { x1: left, x2: left + pw, y1: Y(t), y2: Y(t), stroke: "var(--rule)" });
+    el(svg, "text", { x: left - 8, y: Y(t) + 4, "text-anchor": "end", "font-size": 11.5, class: "q" }, t.toFixed(2));
+  }
+  steps.forEach((s, i) => el(svg, "text", { x: X(i), y: y0 + h + 22, "text-anchor": "middle", "font-size": 11.5, class: "q" }, s + " loops"));
+  el(svg, "line", { x1: X(2), x2: X(2), y1: y0, y2: y0 + h, stroke: "var(--grey)", "stroke-dasharray": "3 3" });
+  el(svg, "text", { x: X(2) + 6, y: y0 + 14, "font-size": 11, class: "q" }, "16 loops (plateau)");
+
+  for (const k in data) {
+    const item = data[k];
+    const pts = item.vals.map((v, i) => [X(i), Y(v)]);
+    path(svg, pts, { stroke: item.col, "stroke-width": item.width });
+    pts.forEach((p, i) => {
+      const d = el(svg, "circle", { cx: p[0], cy: p[1], r: 3.5, fill: item.col });
+      el(d, "title", {}, `${item.label}, ${steps[i]} loops: ${item.vals[i].toFixed(4)}`);
+    });
+    el(svg, "text", { x: X(4) + 12, y: Y(item.vals[4]) + 4, "font-size": 11.5, "font-weight": 600 },
+       `${item.label} (${item.vals[4].toFixed(2)})`);
+  }
+})();
+</script>
+</body>
+</html>
