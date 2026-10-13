@@ -25,6 +25,7 @@ decoded back to text and re-tokenized with Huginn's tokenizer.
 """
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -620,6 +621,259 @@ def stage_latency(model, comp, args, B=1, S=1024, iters=10, warmup=3):
 
 
 # ============================================================
+# Activation-Aware SVD (ASVD)
+# ============================================================
+
+def factorize_asvd(W, S_cov, rank, eps=1e-5):
+    """
+    Activation-weighted SVD for W (d_out, d_in) given input second-moment S_cov (d_in, d_in).
+    Minimizes ||(W - UV) X^T||_F.
+    Returns U (d_out, rank) and V (rank, d_in) in bfloat16.
+    """
+    device = W.device
+    W_f = W.detach().float()
+    S_f = S_cov.to(device=device, dtype=torch.float32)
+
+    # Ensure exact symmetry
+    S_f = 0.5 * (S_f + S_f.T)
+    eigvals, eigvecs = torch.linalg.eigh(S_f)
+
+    # Ridge regularization: clamp eigenvalues to at least eps * max_eigval
+    max_ev = eigvals.max().item()
+    min_ev = max(1e-12, eps * max_ev)
+    eigvals_reg = torch.clamp(eigvals, min=min_ev)
+
+    sqrt_ev = torch.sqrt(eigvals_reg)
+    inv_sqrt_ev = 1.0 / sqrt_ev
+
+    # Factored multiplication without allocating (d_in, d_in)
+    # W_scaled = (W_f @ eigvecs * sqrt_ev) @ eigvecs.T
+    W_scaled = torch.matmul(W_f, eigvecs)
+    W_scaled = W_scaled * sqrt_ev.unsqueeze(0)
+    W_scaled = torch.matmul(W_scaled, eigvecs.T)
+
+    P, Sigma, Qt = torch.linalg.svd(W_scaled, full_matrices=False)
+
+    P_r = P[:, :rank]
+    Sigma_r = Sigma[:rank]
+    Qt_r = Qt[:rank, :]
+
+    sqrt_sig = torch.sqrt(Sigma_r)
+    U = P_r * sqrt_sig.unsqueeze(0)
+
+    V_temp = sqrt_sig.unsqueeze(1) * Qt_r
+    V_temp = torch.matmul(V_temp, eigvecs)
+    V_temp = V_temp * inv_sqrt_ev.unsqueeze(0)
+    V = torch.matmul(V_temp, eigvecs.T)
+
+    return U.bfloat16(), V.bfloat16()
+
+
+class CalibrationCollector:
+    """Collects projection-input second-moment statistics (X^T @ X) for each core projection.
+    Variant B: loop 16 for all M calibration sequences.
+    Variant C: equal split across loops (1, 4, 8, 16, 32), M/5 sequences per loop.
+    Both variants accumulate the exact same total number of token vectors."""
+
+    def __init__(self, comp, sample_loops, total_seqs, seq_len):
+        self.comp = comp
+        self.sample_loops = sorted(sample_loops) # e.g. [1, 4, 8, 16, 32]
+        self.step_to_loop = {s - 1: s for s in self.sample_loops}
+        self.total_seqs = total_seqs
+        self.num_loops = len(self.sample_loops)
+        self.per_loop_seqs = total_seqs // self.num_loops
+
+        # Mapping for Variant C: which sequence index is assigned to which loop
+        self.seq_to_c_loop = {}
+        for idx, loop_val in enumerate(self.sample_loops):
+            start = idx * self.per_loop_seqs
+            end = (idx + 1) * self.per_loop_seqs if idx < self.num_loops - 1 else total_seqs
+            for k in range(start, end):
+                self.seq_to_c_loop[k] = loop_val
+
+        # Second moments (on CPU to preserve GPU memory) and token counts
+        self.cov_B = {}
+        self.count_B = {}
+        self.cov_C = {}
+        self.count_C = {}
+        self.cov_per_loop = {}
+        self.count_per_loop = {}
+
+        for (i, t), lin in comp.orig.items():
+            d_in = lin.in_features
+            self.cov_B[(i, t)] = torch.zeros(d_in, d_in, dtype=torch.float32)
+            self.count_B[(i, t)] = 0
+            self.cov_C[(i, t)] = torch.zeros(d_in, d_in, dtype=torch.float32)
+            self.count_C[(i, t)] = 0
+            for l_val in self.sample_loops:
+                self.cov_per_loop[(i, t, l_val)] = torch.zeros(d_in, d_in, dtype=torch.float32)
+                self.count_per_loop[(i, t, l_val)] = 0
+
+        self.current_seq_offset = 0
+        self.step_counter = {k: 0 for k in comp.orig}
+        self.handles = []
+        self._register_hooks()
+
+    def _register_hooks(self):
+        for (i, t), lin in self.comp.orig.items():
+            h = lin.register_forward_hook(self._make_hook(i, t))
+            self.handles.append(h)
+
+    def _make_hook(self, i, t):
+        def hook(module, inputs, output):
+            step = self.step_counter[(i, t)]
+            self.step_counter[(i, t)] += 1
+            if step in self.step_to_loop:
+                loop_val = self.step_to_loop[step]
+                x = inputs[0].detach() # (B, S, d_in)
+                B, S, d_in = x.shape
+                for b in range(B):
+                    seq_idx = self.current_seq_offset + b
+                    if seq_idx >= self.total_seqs:
+                        continue
+                    x_b = x[b].float() # (S, d_in) on GPU
+                    xx = (x_b.T @ x_b).cpu() # (d_in, d_in) on CPU
+
+                    # Variant B: accumulate loop 16 for ALL sequences
+                    if loop_val == 16:
+                        self.cov_B[(i, t)] += xx
+                        self.count_B[(i, t)] += S
+
+                    # Variant C: accumulate if seq_idx is assigned to loop_val
+                    if self.seq_to_c_loop.get(seq_idx) == loop_val:
+                        self.cov_C[(i, t)] += xx
+                        self.count_C[(i, t)] += S
+
+                    # Per-loop stats
+                    self.cov_per_loop[(i, t, loop_val)] += xx
+                    self.count_per_loop[(i, t, loop_val)] += S
+        return hook
+
+    def reset_step_counters(self, seq_offset):
+        self.current_seq_offset = seq_offset
+        for k in self.step_counter:
+            self.step_counter[k] = 0
+
+    def remove(self):
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
+
+
+def stage_asvd(model, comp, tok, val_data, args):
+    """Activation-aware compression experiment:
+    1. Collect projection-input second moments at loops 1, 4, 8, 16, 32 from train calibration set.
+    2. Build three rank-2048 variants:
+       Variant A: Plain SVD (weight-only baseline)
+       Variant B: Single-loop calibration (loop 16)
+       Variant C: Multi-loop calibration (split equally among loops 1, 4, 8, 16, 32)
+    3. Evaluate without recovery at 16 and 32 loops on the 256-sequence validation set."""
+    print("\n" + "=" * 78)
+    print("ACTIVATION-AWARE SVD (ASVD) COMPRESSION")
+    print(f"  calibration sequences: {args.calib_seqs} (train split)")
+    print(f"  sample loops: {args.asvd_loops}")
+    print(f"  target ranks: {args.ranks}")
+    print("=" * 78)
+
+    comp.restore()
+    calib_data = build_token_set(tok, args.data_dir, "train", args.calib_seqs,
+                                 args.seq_len, args.out_dir, skip_docs=args.calib_skip_docs)
+    M = len(calib_data)
+    print(f"Loaded calibration set: {M} sequences x {args.seq_len} tokens")
+
+    collector = CalibrationCollector(comp, args.asvd_loops, M, args.seq_len)
+    batch_size = min(2, args.batch_size)
+    model.eval()
+
+    t_calib = time.perf_counter()
+    print("Collecting input second-moment statistics across loops...")
+    with torch.no_grad():
+        for b_idx, i in enumerate(range(0, M, batch_size)):
+            chunk = calib_data[i:i + batch_size]
+            collector.reset_step_counters(i)
+            x = chunk[:, :-1].to(args.device)
+            torch.manual_seed(1234 + b_idx)
+            model(input_ids=x, num_steps=max(args.asvd_loops))
+            if (b_idx + 1) % 5 == 0 or (i + batch_size) >= M:
+                print(f"  processed {min(i + batch_size, M)}/{M} sequences "
+                      f"({time.perf_counter() - t_calib:.1f}s)", flush=True)
+
+    collector.remove()
+    print(f"Calibration collection complete in {time.perf_counter() - t_calib:.1f}s.")
+
+    sample_key = (0, "qkv")
+    print(f"  Tokens per projection: Variant B = {collector.count_B[sample_key]:,}, "
+          f"Variant C = {collector.count_C[sample_key]:,}")
+    for l_val in sorted(args.asvd_loops):
+        print(f"    Loop {l_val:>2} in Variant C: {collector.count_per_loop[(0, 'qkv', l_val)]:,} tokens")
+
+    ckpt_dir = Path(args.out_dir) / "asvd_checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt_paths = []
+    for rank in args.ranks:
+        print(f"\nFactorizing core projections at rank {rank}...")
+        t_fact = time.perf_counter()
+
+        factors_plain = {}
+        factors_b = {}
+        factors_c = {}
+
+        for (i, t), lin in comp.orig.items():
+            W = lin.weight
+
+            # Variant A: Plain SVD
+            P, S, Qt = comp.svd[(i, t)]
+            sqrt_s = S[:rank].sqrt()
+            u_plain = (P[:, :rank].float() * sqrt_s).bfloat16()
+            v_plain = (sqrt_s[:, None] * Qt[:rank].float()).bfloat16()
+            factors_plain[(i, t)] = {"U.weight": u_plain, "V.weight": v_plain}
+
+            # Variant B: Single-loop ASVD (loop 16)
+            S_B = collector.cov_B[(i, t)] / max(1, collector.count_B[(i, t)])
+            u_b, v_b = factorize_asvd(W, S_B, rank)
+            factors_b[(i, t)] = {"U.weight": u_b, "V.weight": v_b}
+
+            # Variant C: Multi-loop ASVD (loops 1, 4, 8, 16, 32)
+            S_C = collector.cov_C[(i, t)] / max(1, collector.count_C[(i, t)])
+            u_c, v_c = factorize_asvd(W, S_C, rank)
+            factors_c[(i, t)] = {"U.weight": u_c, "V.weight": v_c}
+            print(f"  factorized block[{i}].{t} (ASVD B and C)", flush=True)
+
+        p_plain = ckpt_dir / f"factors_r{rank}_plain.pt"
+        p_b = ckpt_dir / f"factors_r{rank}_asvd_single16.pt"
+        p_c = ckpt_dir / f"factors_r{rank}_asvd_multi.pt"
+
+        torch.save({"factors": factors_plain, "variant": "A_plain", "rank": rank}, p_plain)
+        torch.save({"factors": factors_b, "variant": "B_asvd_single16", "rank": rank}, p_b)
+        torch.save({"factors": factors_c, "variant": "C_asvd_multi", "rank": rank}, p_c)
+
+        print(f"Saved factor checkpoints ({time.perf_counter() - t_fact:.1f}s):")
+        print(f"  Variant A: {p_plain}")
+        print(f"  Variant B: {p_b}")
+        print(f"  Variant C: {p_c}")
+
+        ckpt_paths.extend([str(p_plain), str(p_b), str(p_c)])
+
+    # Evaluate without recovery on the validation set at specified loop steps
+    print("\n" + "=" * 78)
+    print(f"EVALUATING ASVD VARIANTS WITHOUT RECOVERY (steps={args.steps})")
+    print("=" * 78)
+
+    eval_args = copy.copy(args)
+    eval_args.resume_factors = ckpt_paths
+    eval_rows = stage_eval_loops(model, comp, val_data, eval_args)
+
+    return {
+        "calib_seqs": args.calib_seqs,
+        "sample_loops": args.asvd_loops,
+        "token_count": collector.count_B[sample_key],
+        "checkpoints": ckpt_paths,
+        "eval_results": eval_rows,
+    }
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -627,7 +881,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--stage", default="all",
                    choices=["all", "spectrum", "compress", "error", "recover",
-                            "eval-loops", "latency"])
+                            "eval-loops", "latency", "asvd"])
     p.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     p.add_argument("--out-dir", default="results/huginn")
     p.add_argument("--ranks", type=int, nargs="+", default=[256, 512, 1024, 2048])
@@ -656,6 +910,13 @@ def main():
                    help="Starting data iterator position for continuation")
     p.add_argument("--start-step", type=int, default=0,
                    help="Global step offset for continuation runs")
+    # activation-aware SVD (ASVD) calibration
+    p.add_argument("--calib-seqs", type=int, default=50,
+                   help="Number of training sequences for calibration")
+    p.add_argument("--calib-skip-docs", type=int, default=0,
+                   help="Document skip offset for calibration split")
+    p.add_argument("--asvd-loops", type=int, nargs="+", default=[1, 4, 8, 16, 32],
+                   help="Recurrent loops to sample for calibration")
     args = p.parse_args()
 
     args.device = "cuda"
@@ -695,6 +956,8 @@ def main():
         results["recover"] = stage_recover(model, comp, train, val, args)
     if args.stage == "eval-loops":
         results["eval_loops"] = stage_eval_loops(model, comp, val, args)
+    if args.stage == "asvd":
+        results["asvd"] = stage_asvd(model, comp, tok, val, args)
 
     path = os.path.join(args.out_dir, f"results_{args.stage}.json")
     with open(path, "w") as f:
